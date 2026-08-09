@@ -22,11 +22,10 @@ test('registers every plugin tool under plugins/', async () => {
   ]);
 });
 
-test('same hook in two plugins runs both, not the last one', async () => {
+test('the same hook declared twice runs both times, not just the last', async () => {
   const hooks = await plugin({}, {});
-  // `event` comes from notify, `config` from hrbook and from the skills
-  // registration in index.js — the merge has to chain them, not overwrite.
-  assert.equal(typeof hooks.event, 'function');
+  // `config` comes from hrbook and from the skills registration in index.js —
+  // the merge has to chain them, not let one overwrite the other.
   const cfg = {};
   await hooks.config(cfg);
   assert.ok(cfg.agent?.hrbook, 'hrbook config hook ran');

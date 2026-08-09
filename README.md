@@ -22,7 +22,6 @@ Pin a tag when you want a fixed version: `"github:nedleeds/opencode#v0.1.0"`.
 |---|---|
 | `hrbook` agent | HD현대로보틱스 Hi6/Hi7 제어기 매뉴얼 Q&A |
 | `hrbook_search` `hrbook_read` `hrbook_catalog` | manual search over a local cache — see [plugins/hrbook](plugins/hrbook) |
-| [`notify`](plugins/notify) | macOS notification on session idle, error and permission prompt |
 
 Select the agent in the TUI with `Tab`, or start there: `opencode --agent hrbook`.
 
