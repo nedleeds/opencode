@@ -74,11 +74,15 @@ Sync downloads one tarball per manual and keeps only `.md`, so the cache stays
 small: the four default manuals are **855 pages in 4.8 MB** and take about
 10 seconds.
 
-## Closed / corporate network
+## Restricted networks and mirrors
 
-Everything network-facing is overridable, and downloads go through `curl`, which
-honours `HTTP_PROXY` / `HTTPS_PROXY` and the system CA store (Node's `fetch`
-ignores proxy variables, which is why it is not used here).
+Auto-sync only needs `codeload.github.com` and `raw.githubusercontent.com`. **On
+a corporate network where GitHub is reachable, set none of this** — the defaults
+work, proxies included: downloads go through `curl`, which honours `HTTP_PROXY` /
+`HTTPS_PROXY` and the system CA store (Node's `fetch` ignores proxy variables,
+which is why it is not used here).
+
+Everything network-facing is overridable for the networks where it is not:
 
 | Variable | Default | Use |
 |---|---|---|
@@ -86,7 +90,7 @@ ignores proxy variables, which is why it is not used here).
 | `HRBOOK_TARBALL_BASE` | `https://codeload.github.com/hyundai-robotics` | Internal Git mirror |
 | `HRBOOK_BOOKINFOS_URL` | raw.githubusercontent.com/…/bookinfos.json | Internal copy |
 | `HRBOOK_VIEWER_BASE` | `https://hrbook-hrc.web.app` | Internal manual viewer |
-| `HRBOOK_AUTOSYNC` | `1` | Set to `0` on a fully closed network so a miss fails fast |
+| `HRBOOK_AUTOSYNC` | `1` | Set to `0` only where GitHub is blocked and no mirror is configured, so a miss fails fast instead of waiting out the timeout |
 
 **Fully offline:** sync on a machine with access, then copy `~/.cache/hrbook` to
 the target machine (or a network share) and set `HRBOOK_CACHE` to it. No further

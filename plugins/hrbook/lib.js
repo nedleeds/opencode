@@ -312,7 +312,7 @@ export async function search(query, opts = {}) {
   return { hits: unique.slice(0, limit), scanned, total: unique.length };
 }
 
-/** Set HRBOOK_AUTOSYNC=0 on a closed network so a miss fails fast instead of hanging. */
+/** Set HRBOOK_AUTOSYNC=0 where GitHub is blocked and no mirror is configured, so a miss fails fast instead of hanging. */
 export const AUTOSYNC = process.env.HRBOOK_AUTOSYNC !== '0';
 
 /**
