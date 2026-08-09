@@ -20,10 +20,10 @@ Pin a tag when you want a fixed version: `"github:nedleeds/opencode#v0.1.0"`.
 
 | | |
 |---|---|
-| `hrbook` agent | HD현대로보틱스 Hi6/Hi7 제어기 매뉴얼 Q&A |
+| `HRBook` agent | HD현대로보틱스 Hi6/Hi7 제어기 매뉴얼 Q&A |
 | `hrbook_search` `hrbook_read` `hrbook_catalog` | manual search over a local cache — see [plugins/hrbook](plugins/hrbook) |
 
-Select the agent in the TUI with `Tab`, or start there: `opencode --agent hrbook`.
+Select the agent in the TUI with `Tab`, or start there: `opencode --agent HRBook`.
 
 ## How installing from git behaves
 
@@ -82,8 +82,14 @@ export default async () => ({
 `index.js` discovers the directory on its own — no registration, and no change
 on the users' side, since the link they pinned already points at it.
 
-Two things about the `config` hook are worth knowing before you fight them:
+Three things about the `config` hook are worth knowing before you fight them:
 
+- **The key is the agent's name — never set `name`.** With both, opencode lists
+  the agent under `name` while the prompt path still resolves it by key, so the
+  agent shows up in `opencode agent list` and in the TUI picker, and then every
+  prompt sent to it dies as `UnknownError` — surfaced as a bare *"Failed to send
+  prompt / Unexpected server error"* with no cause in the logs. Capitalise the
+  key if you want a capitalised name.
 - An agent's tool list comes from its **permission ruleset**. The `tools: { x:
   false }` shorthand is folded into permissions while the config files are
   parsed, which happens before any plugin runs — so a `tools` map set from a
@@ -104,7 +110,7 @@ npm test
 Point opencode at the working copy instead of GitHub while iterating:
 
 ```jsonc
-{ "plugin": ["/Users/dhl/Src/opencode"] }
+{ "plugin": ["/path/to/your/clone/of/opencode"] }
 ```
 
 A local path is imported directly — no clone, no install — so edits apply on the

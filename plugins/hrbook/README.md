@@ -4,7 +4,7 @@ Answers questions about HD Hyundai Robotics **Hi6 / Hi7** controller manuals fro
 a **local cache** of the manual sources.
 
 Registers three tools (`hrbook_search`, `hrbook_read`, `hrbook_catalog`) and the
-`hrbook` agent that drives them. Installed with the repo — see the
+`HRBook` agent that drives them. Installed with the repo — see the
 [root README](../../README.md).
 
 ## Why it is built this way
@@ -24,7 +24,7 @@ three things that make agent tools slow and expensive:
   per hit. The model only calls `hrbook_read` for the one or two pages it
   actually needs.
 
-Measured: an `hrbook` session starts at **~4,200 tokens** of context — roughly
+Measured: an `HRBook` session starts at **~4,200 tokens** of context — roughly
 half a default `build` session, because only three tools are enabled and
 `write`/`edit`/`bash` are off — and a typical question costs 3 model calls and
 about $0.03.
@@ -110,7 +110,7 @@ Node 18+, plus `curl` and `tar` on `PATH` (both are standard on macOS and Linux)
 
 | | |
 |---|---|
-| `index.js` | tool definitions + the `hrbook` agent |
+| `index.js` | tool definitions + the `HRBook` agent |
 | `agent.md` | the agent's system prompt |
 | `lib.js` | cache, search, ranking, sync — no opencode coupling, so it is testable on its own |
 | `cli.js` | `hrbook-sync` |

@@ -21,9 +21,11 @@ const TOOL_NAMES = ['hrbook_search', 'hrbook_read', 'hrbook_catalog'];
  */
 async function agentConfig() {
   return {
-    name: 'HRBook',
+    // No `name` field — the key under `cfg.agent` is the agent's name, and a
+    // second one here breaks every prompt sent to the agent. See the root
+    // README, "Adding a plugin".
     description:
-      'HD현대로보틱스 Hi6/Hi7 제어기 메뉴얼 Q&A. 조작·기능·Open API 관련 질문에 사용.',
+      'HD현대로보틱스 Hi6/Hi7 제어기 메뉴얼 Q&A. 조작·기능·Open API 등에 대한 질문에 사용.',
     mode: 'primary',
     prompt: await readFile(path.join(HERE, 'agent.md'), 'utf8'),
     // `permission`, not `tools`. In opencode 1.18 an agent's tool list is
@@ -48,11 +50,11 @@ export const HrBookPlugin = async () => ({
   async config(cfg) {
     cfg.agent = cfg.agent ?? {};
 
-    // A user who has written their own `hrbook` agent meant it, so anything
+    // A user who has written their own `HRBook` agent meant it, so anything
     // they set wins — down to the individual permission.
     const defaults = await agentConfig();
-    const existing = cfg.agent.hrbook ?? {};
-    cfg.agent.hrbook = {
+    const existing = cfg.agent.HRBook ?? {};
+    cfg.agent.HRBook = {
       ...defaults,
       ...existing,
       permission: { ...defaults.permission, ...existing.permission },

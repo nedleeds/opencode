@@ -28,7 +28,7 @@ test('the same hook declared twice runs both times, not just the last', async ()
   // the merge has to chain them, not let one overwrite the other.
   const cfg = {};
   await hooks.config(cfg);
-  assert.ok(cfg.agent?.hrbook, 'hrbook config hook ran');
+  assert.ok(cfg.agent?.HRBook, 'hrbook config hook ran');
   assert.ok(cfg.skills?.paths?.length, 'skills config hook ran too');
 });
 
@@ -37,12 +37,23 @@ test('config hook contributes the hrbook agent with its prompt inlined', async (
   const cfg = {};
   await hooks.config(cfg);
 
-  assert.equal(cfg.agent.hrbook.mode, 'primary');
-  assert.match(cfg.agent.hrbook.prompt, /HRBook/);
+  assert.equal(cfg.agent.HRBook.mode, 'primary');
+  assert.match(cfg.agent.HRBook.prompt, /HRBook/);
   // Editing tools are switched off through permissions; a `tools` map set from
   // a plugin is ignored by opencode 1.18 (see plugins/hrbook/index.js).
-  assert.equal(cfg.agent.hrbook.permission.edit, 'deny');
-  assert.equal(cfg.agent.hrbook.permission.bash, 'deny');
+  assert.equal(cfg.agent.HRBook.permission.edit, 'deny');
+  assert.equal(cfg.agent.HRBook.permission.bash, 'deny');
+});
+
+test('the agent carries no `name` field — the key is the name', async () => {
+  const hooks = await plugin({}, {});
+  const cfg = {};
+  await hooks.config(cfg);
+
+  // A `name` here makes the agent list and appear in the TUI picker, but every
+  // prompt sent to it fails with a bare `UnknownError` because the prompt path
+  // resolves agents by config key. Regression guard for that.
+  assert.equal(cfg.agent.HRBook.name, undefined);
 });
 
 test('manual tools stay off in coding agents, and user settings still win', async () => {
@@ -50,7 +61,7 @@ test('manual tools stay off in coding agents, and user settings still win', asyn
   const cfg = {
     agent: {
       build: { permission: { hrbook_search: 'allow' } },
-      hrbook: { permission: { bash: 'allow' } },
+      HRBook: { permission: { bash: 'allow' } },
     },
   };
   await hooks.config(cfg);
@@ -59,8 +70,8 @@ test('manual tools stay off in coding agents, and user settings still win', asyn
   assert.equal(cfg.agent.build.permission.hrbook_read, 'deny');
   assert.equal(cfg.agent.plan.permission.hrbook_catalog, 'deny');
 
-  assert.equal(cfg.agent.hrbook.permission.bash, 'allow', 'user value must survive');
-  assert.equal(cfg.agent.hrbook.permission.edit, 'deny', 'untouched defaults stay');
+  assert.equal(cfg.agent.HRBook.permission.bash, 'allow', 'user value must survive');
+  assert.equal(cfg.agent.HRBook.permission.edit, 'deny', 'untouched defaults stay');
 });
 
 test('skills directory is registered once, alongside any the user configured', async () => {
