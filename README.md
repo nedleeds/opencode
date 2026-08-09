@@ -16,6 +16,9 @@ be pasted into the user's config.
 
 Pin a tag when you want a fixed version: `"github:nedleeds/opencode#v0.1.0"`.
 
+How the whole thing fits together — from that one line to a tool call, with call
+sequences — is written up in [Sequence.md](Sequence.md) (Korean).
+
 ## What is included
 
 | | |

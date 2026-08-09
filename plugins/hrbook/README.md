@@ -7,6 +7,9 @@ Registers three tools (`hrbook_search`, `hrbook_read`, `hrbook_catalog`) and the
 `HRBook` agent that drives them. Installed with the repo — see the
 [root README](../../README.md).
 
+This file covers **why** it is built this way. For the runtime sequence — plugin
+load, agent registration, when each tool fires — see [Sequence.md](../../Sequence.md).
+
 ## Why it is built this way
 
 Manual lookups happen constantly and must feel instant, so the design avoids the
