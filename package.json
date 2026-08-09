@@ -1,0 +1,35 @@
+{
+  "name": "@nedleeds/opencode",
+  "version": "0.1.0",
+  "description": "opencode extensions: plugins (tools + agents) and skills, installable straight from GitHub",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "bin": {
+    "hrbook-sync": "plugins/hrbook/cli.js"
+  },
+  "files": [
+    "index.js",
+    "tool.js",
+    "plugins",
+    "skills",
+    "README.md"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nedleeds/opencode.git"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "zod": "4.1.8"
+  }
+}
