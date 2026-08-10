@@ -338,13 +338,18 @@ export async function searchWithAutoSync(query, opts = {}) {
     limit: 2,
   });
 
-  // Fetch on a miss, but also when the query names a manual we do not have —
-  // a score of 4+ means the words matched a book_id segment or a topic alias,
-  // not just an incidental title word. Without this, a weak false-positive hit
-  // in an already-cached manual would suppress fetching the right one.
   const strong = ranked.filter((e) => e.score >= 4);
-  const wanted = (first.hits.length === 0 ? ranked : strong).filter(
-    (e) => !cachedKeys.has(`${e.book_id}/${e.ver_id}`),
+
+  // A named book_id is already a decision — the model picked it out of the
+  // catalog. Ranking exists for guessing, and it never sees book_id anyway.
+  // Every version of that book is taken: `lang` and `ver_id` are used
+  // interchangeably by callers, so filtering by it drops the right entry.
+  const named = opts.book_id ? infos.filter((e) => e.book_id === opts.book_id) : [];
+
+  const wanted = [...named, ...(first.hits.length === 0 ? ranked : strong)].filter(
+    (e, i, a) =>
+      !cachedKeys.has(`${e.book_id}/${e.ver_id}`) &&
+      a.findIndex((x) => x.book_id === e.book_id && x.ver_id === e.ver_id) === i,
   );
   if (wanted.length === 0) return { ...first, synced: [] };
   const candidates = wanted;
