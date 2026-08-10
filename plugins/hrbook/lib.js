@@ -60,7 +60,7 @@ export async function loadBookinfos() {
 
 /** Deep link into the HRBook web viewer for a cached page. */
 export function viewerUrl(book, ver, relPath, contModel) {
-  const page = relPath.replace(/\.md$/i, '');
+  const page = relPath.replace(/\\/g, '/').replace(/\.md$/i, '');
   const q = contModel ? `?cont_model=${encodeURIComponent(contModel)}` : '';
   return `${VIEWER_BASE}/#/view/${book}/${ver}/${page}${q}`;
 }
