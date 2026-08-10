@@ -49,7 +49,11 @@ async function readText(file) {
 
 export async function loadBookinfos() {
   if (!existsSync(BOOKINFOS)) {
-    throw new Error(`bookinfos.json not cached. Run: npx hrbook-sync --refresh`);
+    try {
+      await download(BOOKINFOS_URL, BOOKINFOS);
+    } catch (e) {
+      throw new Error(`bookinfos.json fetch failed (${BOOKINFOS_URL}): ${e.message}`);
+    }
   }
   return JSON.parse(await readText(BOOKINFOS));
 }
