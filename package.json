@@ -1,6 +1,6 @@
 {
   "name": "@hdr/opencode",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publishConfig": {
     "registry": "http://10.130.91.186:4873/"
   },
