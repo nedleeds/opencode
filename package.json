@@ -1,6 +1,9 @@
 {
-  "name": "@nedleeds/opencode",
+  "name": "@hdr/opencode",
   "version": "0.1.0",
+  "publishConfig": {
+      "registry": "http://10.130.91.186:4873/"
+  },
   "description": "opencode extensions: plugins (tools + agents) and skills, installable straight from GitHub",
   "type": "module",
   "main": "index.js",
@@ -22,10 +25,6 @@
     "opencode-plugin"
   ],
   "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/nedleeds/opencode.git"
-  },
   "scripts": {
     "test": "node --test test/*.test.js"
   },

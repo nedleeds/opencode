@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -33,7 +33,9 @@ const VIEWER_BASE = process.env.HRBOOK_VIEWER_BASE || 'https://hrbook-hrc.web.ap
  */
 async function download(url, dest) {
   await mkdir(path.dirname(dest), { recursive: true });
-  await run('curl', ['-sSL', '--fail', '--max-time', '180', '-o', dest, url]);
+  const REVOKE = process.platform === 'win32' ? ['--ssl-no-revoke'] : [];
+
+  await run('curl', ['-sSL', '--fail', ...REVOKE, '--max-time', '180', '-o', dest, url]);
 }
 
 /**
@@ -425,7 +427,9 @@ export async function syncBook(book, ver) {
     const kept = await pruneToMarkdown(tmp);
     await rm(dest, { recursive: true, force: true });
     await mkdir(path.dirname(dest), { recursive: true });
-    await run('mv', [tmp, dest]);
+    await mkdir(path.dirname(dest), { recursive: true });
+    await rm(dest, { recursive: true, force: true });
+    await rename(tmp, dest);
     return kept;
   } finally {
     // Never leave tarballs or half-extracted trees behind on failure.
