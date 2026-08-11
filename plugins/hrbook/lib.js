@@ -17,6 +17,7 @@ const run = promisify(execFile);
 export const CACHE = process.env.HRBOOK_CACHE || path.join(homedir(), '.cache', 'hrbook');
 export const BOOKS_DIR = path.join(CACHE, 'books');
 export const BOOKINFOS = path.join(CACHE, 'bookinfos.json');
+export const SYNC_MANIFEST = path.join(CACHE, 'sync-manifest.json');
 
 /** Overridable so an internal mirror can be used instead of github.com. */
 const TARBALL_BASE =
@@ -79,14 +80,29 @@ export async function listCached() {
   for (const book of await readdir(BOOKS_DIR)) {
     const bookDir = path.join(BOOKS_DIR, book);
     if (!(await stat(bookDir)).isDirectory()) continue;
-    for (const ver of await readdir(bookDir)) {
-      if ((await stat(path.join(bookDir, ver))).isDirectory()) out.push({ book, ver });
+    
+    const gitDir = path.join(bookDir, '.git');
+    if (existsSync(gitDir)) {
+      try {
+        const { stdout: branch } = await run('git', ['-C', bookDir, 'branch', '--show-current']);
+        const currentBranch = branch.trim();
+        if (currentBranch) out.push({ book, ver: currentBranch, git: true });
+      } catch {
+        // Not a git repo or error
+      }
+    } else {
+      for (const ver of await readdir(bookDir)) {
+        if ((await stat(path.join(bookDir, ver))).isDirectory()) {
+          out.push({ book, ver, git: false });
+        }
+      }
     }
   }
   return out;
 }
 
 async function walkMarkdown(dir, base = dir, acc = []) {
+  if (!existsSync(dir)) return acc;
   for (const entry of await readdir(dir, { withFileTypes: true })) {
     if (entry.name.startsWith('.')) continue;
     const full = path.join(dir, entry.name);
@@ -256,18 +272,18 @@ export async function search(query, opts = {}) {
   const hits = [];
   let scanned = 0;
 
-  for (const { book, ver } of cached) {
+  for (const { book, ver, git } of cached) {
     if (bookFilter && book !== bookFilter) continue;
     if (!matchesLang(ver, lang)) continue;
     const info = meta(infos, book, ver);
     if (product && info && !info.products?.includes(product.toLowerCase())) continue;
 
-    const root = path.join(BOOKS_DIR, book, ver);
+    const root = git ? path.join(BOOKS_DIR, book) : path.join(BOOKS_DIR, book, ver);
     let pages;
     try {
       pages = await walkMarkdown(root);
     } catch {
-      continue; // being replaced by a concurrent sync
+      continue;
     }
     for (const rel of pages) {
       if (SKIP_FILES.has(path.basename(rel).toLowerCase())) continue;
@@ -283,13 +299,12 @@ export async function search(query, opts = {}) {
       const inPath = terms.filter((t) => relLower.includes(t)).length;
       const heading = headingFor(lines, line);
       const inHeading = terms.filter((t) => heading.toLowerCase().includes(t)).length;
-      // Path and heading matches mean the page is *about* the topic; a line
-      // covering every term beats one that only brushes a single word.
       const score = inPath * 10 + inHeading * 5 + matched * 2 + 1;
 
       hits.push({
         book,
         ver,
+        git,
         path: rel,
         title: info?.title ?? book,
         heading,
@@ -302,8 +317,6 @@ export async function search(query, opts = {}) {
 
   hits.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path));
 
-  // Collapse the Hi6/Hi7 duplicates of a page. Without this half the result
-  // slots — and half the tokens they cost — go to bytes the model already has.
   const byPage = new Map();
   for (const h of hits) {
     const key = `${h.book}|${langKey(h.ver)}|${h.path}`;
@@ -331,7 +344,8 @@ export async function searchWithAutoSync(query, opts = {}) {
   if (!AUTOSYNC) return { ...first, synced: [] };
 
   const infos = await loadBookinfos();
-  const cachedKeys = new Set((await listCached()).map((c) => `${c.book}/${c.ver}`));
+  const cached = await listCached();
+  const cachedBooks = new Set(cached.map((c) => c.book));
   const ranked = rankBooks(query, infos, {
     product: opts.product,
     lang: opts.lang,
@@ -340,27 +354,25 @@ export async function searchWithAutoSync(query, opts = {}) {
 
   const strong = ranked.filter((e) => e.score >= 4);
 
-  // A named book_id is already a decision — the model picked it out of the
-  // catalog. Ranking exists for guessing, and it never sees book_id anyway.
-  // Every version of that book is taken: `lang` and `ver_id` are used
-  // interchangeably by callers, so filtering by it drops the right entry.
   const named = opts.book_id ? infos.filter((e) => e.book_id === opts.book_id) : [];
 
   const wanted = [...named, ...(first.hits.length === 0 ? ranked : strong)].filter(
     (e, i, a) =>
-      !cachedKeys.has(`${e.book_id}/${e.ver_id}`) &&
-      a.findIndex((x) => x.book_id === e.book_id && x.ver_id === e.ver_id) === i,
+      !cachedBooks.has(e.book_id) &&
+      a.findIndex((x) => x.book_id === e.book_id) === i,
   );
   if (wanted.length === 0) return { ...first, synced: [] };
-  const candidates = wanted;
 
   const synced = [];
-  for (const c of candidates) {
+  for (const c of wanted) {
     try {
-      await syncBook(c.book_id, c.ver_id);
+      await syncBook(c.book_id, c.ver_id, true);
+      if (opts.lang) {
+        await checkoutBook(c.book_id, c.ver_id);
+      }
       synced.push(`${c.book_id}/${c.ver_id}`);
     } catch {
-      // Offline or blocked: fall through and report the miss honestly.
+      continue;
     }
   }
   if (synced.length === 0) return { ...first, synced: [] };
@@ -371,9 +383,12 @@ export async function searchWithAutoSync(query, opts = {}) {
 
 export async function readPage(book, ver, relPath, maxBytes = 12000) {
   const rel = relPath.endsWith('.md') ? relPath : `${relPath}.md`;
-  const root = path.join(BOOKS_DIR, book, ver);
+  
+  const bookDir = path.join(BOOKS_DIR, book);
+  const isGit = existsSync(path.join(bookDir, '.git'));
+  const root = isGit ? bookDir : path.join(bookDir, ver);
+  
   const full = path.resolve(root, rel);
-  // Keep the agent inside the cache even if it passes `../` in a path.
   if (!full.startsWith(path.resolve(root) + path.sep)) throw new Error('path escapes book root');
   if (!existsSync(full)) throw new Error(`not cached: ${book}/${ver}/${rel}`);
 
@@ -413,38 +428,141 @@ async function pruneToMarkdown(dir) {
   return kept;
 }
 
-/**
- * One tarball per book/branch instead of hundreds of per-file requests, and
- * only markdown is kept — image assets are the bulk of the repo and useless
- * for text search.
- *
- * Extract-then-prune rather than `tar --wildcards '*.md'`: that flag is GNU
- * tar only, and macOS ships bsdtar, which fails outright. Pruning afterwards
- * behaves identically on both.
- */
-export async function syncBook(book, ver) {
-  const tmp = path.join(CACHE, '.tmp', `${book}-${ver}`);
-  const tgz = `${tmp}.tar.gz`;
-  const dest = path.join(BOOKS_DIR, book, ver);
+const GIT_REPO_BASE = 'https://github.com/hyundai-robotics';
 
+async function gitClone(book, dest) {
+  await mkdir(path.dirname(dest), { recursive: true });
+  await run('git', ['clone', '--depth', '1', '--no-checkout', `${GIT_REPO_BASE}/${book}.git`, dest]);
+  await run('git', ['-C', dest, 'fetch', 'origin', '+refs/heads/*:refs/remotes/origin/*']);
+}
+
+async function gitCheckout(dest, branch) {
+  await run('git', ['-C', dest, 'checkout', branch]);
+}
+
+async function gitEnsureBranch(dest, branch) {
   try {
-    await download(`${TARBALL_BASE}/${book}/tar.gz/${ver}`, tgz);
-    await rm(tmp, { recursive: true, force: true });
-    await mkdir(tmp, { recursive: true });
-    await run('tar', ['xzf', tgz, '-C', tmp, '--strip-components=1']);
-
-    const kept = await pruneToMarkdown(tmp);
-    await rm(dest, { recursive: true, force: true });
-    await mkdir(path.dirname(dest), { recursive: true });
-    await mkdir(path.dirname(dest), { recursive: true });
-    await rm(dest, { recursive: true, force: true });
-    await rename(tmp, dest);
-    return kept;
-  } finally {
-    // Never leave tarballs or half-extracted trees behind on failure.
-    await rm(tgz, { force: true });
-    await rm(tmp, { recursive: true, force: true });
+    const { stdout: current } = await run('git', ['-C', dest, 'branch', '--show-current']);
+    const currentBranch = current.trim();
+    if (currentBranch === branch) return;
+    
+    await run('git', ['-C', dest, 'fetch', 'origin', `refs/heads/${branch}:refs/remotes/origin/${branch}`]);
+    await run('git', ['-C', dest, 'checkout', branch]);
+  } catch {
+    await run('git', ['-C', dest, 'fetch', '--unshallow']);
+    await run('git', ['-C', dest, 'fetch', 'origin', `refs/heads/${branch}:refs/remotes/origin/${branch}`]);
+    try {
+      await run('git', ['-C', dest, 'checkout', '-b', branch, `origin/${branch}`]);
+    } catch (err) {
+      throw new Error(`Failed to checkout branch ${branch}: ${err.message}`);
+    }
   }
+}
+
+export async function syncBook(book, ver, useGit = false) {
+  const dest = path.join(BOOKS_DIR, book);
+
+  if (useGit) {
+    if (!existsSync(dest)) {
+      await gitClone(book, dest);
+    }
+    await gitEnsureBranch(dest, ver);
+    
+    const pages = await walkMarkdown(dest);
+    return pages.length;
+  } else {
+    const tmp = path.join(CACHE, '.tmp', `${book}-${ver}`);
+    const tgz = `${tmp}.tar.gz`;
+    const verDest = path.join(dest, ver);
+
+    try {
+      await download(`${TARBALL_BASE}/${book}/tar.gz/${ver}`, tgz);
+      await rm(tmp, { recursive: true, force: true });
+      await mkdir(tmp, { recursive: true });
+      await run('tar', ['xzf', tgz, '-C', tmp, '--strip-components=1']);
+
+      const kept = await pruneToMarkdown(tmp);
+      await rm(verDest, { recursive: true, force: true });
+      await mkdir(path.dirname(verDest), { recursive: true });
+      await rename(tmp, verDest);
+      return kept;
+    } finally {
+      await rm(tgz, { force: true });
+      await rm(tmp, { recursive: true, force: true });
+    }
+  }
+}
+
+export async function checkoutBook(book, ver) {
+  const dest = path.join(BOOKS_DIR, book);
+  if (!existsSync(dest)) {
+    await syncBook(book, ver, true);
+  } else {
+    await gitEnsureBranch(dest, ver);
+  }
+}
+
+export async function getBookCurrentBranch(book) {
+  const dest = path.join(BOOKS_DIR, book);
+  if (!existsSync(dest)) return null;
+  
+  const gitDir = path.join(dest, '.git');
+  if (!existsSync(gitDir)) return null;
+  
+  try {
+    const { stdout } = await run('git', ['-C', dest, 'branch', '--show-current']);
+    return stdout.trim();
+  } catch {
+    return null;
+  }
+}
+
+export async function checkBookHasUpdates(book, targetBranch) {
+  const dest = path.join(BOOKS_DIR, book);
+  if (!existsSync(dest)) return { needsSync: true, reason: 'not-cloned' };
+  
+  const gitDir = path.join(dest, '.git');
+  if (!existsSync(gitDir)) return { needsSync: false, reason: 'not-git' };
+  
+  try {
+    await run('git', ['-C', dest, 'fetch', 'origin', targetBranch]);
+    const { stdout: local } = await run('git', ['-C', dest, 'rev-parse', 'HEAD']);
+    const { stdout: remote } = await run('git', ['-C', dest, 'rev-parse', `origin/${targetBranch}`]);
+    
+    if (local.trim() !== remote.trim()) {
+      return { needsSync: true, reason: 'updates-available' };
+    }
+    return { needsSync: false, reason: 'up-to-date' };
+  } catch {
+    return { needsSync: false, reason: 'check-failed' };
+  }
+}
+
+export async function checkAllBooksUpdates() {
+  const infos = await loadBookinfos();
+  const fetchable = infos.filter((e) => !e.url);
+  
+  const byBook = new Map();
+  for (const entry of fetchable) {
+    if (!byBook.has(entry.book_id)) {
+      byBook.set(entry.book_id, entry.ver_id);
+    }
+  }
+  
+  const updates = [];
+  for (const [bookId, verId] of byBook) {
+    const currentBranch = await getBookCurrentBranch(bookId);
+    if (!currentBranch) {
+      updates.push({ book: bookId, target: verId, current: null, needsSync: true });
+    } else {
+      const status = await checkBookHasUpdates(bookId, verId);
+      if (status.needsSync) {
+        updates.push({ book: bookId, target: verId, current: currentBranch, needsSync: true });
+      }
+    }
+  }
+  
+  return updates;
 }
 
 export async function writeManifest(entries) {
@@ -452,4 +570,121 @@ export async function writeManifest(entries) {
     path.join(CACHE, 'manifest.json'),
     JSON.stringify({ syncedAt: new Date().toISOString(), books: entries }, null, 2),
   );
+}
+
+export async function loadSyncManifest() {
+  if (!existsSync(SYNC_MANIFEST)) return { lastSync: null, books: {} };
+  try {
+    return JSON.parse(await readText(SYNC_MANIFEST));
+  } catch {
+    return { lastSync: null, books: {} };
+  }
+}
+
+export async function saveSyncManifest(lastSync, books) {
+  await mkdir(CACHE, { recursive: true });
+  await writeFile(
+    SYNC_MANIFEST,
+    JSON.stringify({ lastSync, books }, null, 2),
+  );
+}
+
+export async function syncAllBooks(progressCallback) {
+  const infos = await loadBookinfos();
+  const cached = await listCached();
+  const cachedKeys = new Set(cached.map((c) => `${c.book}/${c.ver}`));
+  
+  const fetchable = infos.filter(fetchable);
+  
+  const byBook = new Map();
+  for (const entry of fetchable) {
+    if (!byBook.has(entry.book_id)) {
+      byBook.set(entry.book_id, new Set());
+    }
+    byBook.get(entry.book_id).add(entry.ver_id);
+  }
+  
+  const totalBooks = byBook.size;
+  const synced = [];
+  const failed = [];
+  
+  if (progressCallback) {
+    progressCallback({ type: 'start', total: totalBooks, synced: 0, failed: 0 });
+  }
+  
+  for (const [bookId, versions] of byBook) {
+    for (const verId of versions) {
+      const key = `${bookId}/${verId}`;
+      
+      if (cachedKeys.has(key)) {
+        if (progressCallback) {
+          progressCallback({ type: 'skip', book: bookId, ver: verId, synced: synced.length, failed: failed.length });
+        }
+        continue;
+      }
+      
+      try {
+        await syncBook(bookId, verId);
+        synced.push(key);
+        if (progressCallback) {
+          progressCallback({ type: 'success', book: bookId, ver: verId, synced: synced.length, failed: failed.length });
+        }
+      } catch (err) {
+        failed.push({ book: bookId, ver: verId, error: err.message });
+        if (progressCallback) {
+          progressCallback({ type: 'error', book: bookId, ver: verId, error: err.message, synced: synced.length, failed: failed.length });
+        }
+      }
+    }
+  }
+  
+  if (progressCallback) {
+    progressCallback({ type: 'complete', synced, failed, total: totalBooks });
+  }
+  
+  return { synced, failed, total: totalBooks };
+}
+
+export async function checkBookUpdates() {
+  const manifest = await loadSyncManifest();
+  const infos = await loadBookinfos();
+  const updates = [];
+  
+  for (const entry of infos) {
+    if (entry.url) continue;
+    
+    const key = `${entry.book_id}/${entry.ver_id}`;
+    const lastInfo = manifest.books?.[key];
+    
+    try {
+      const { stdout } = await run('curl', [
+        '-sI',
+        `${TARBALL_BASE}/${entry.book_id}/tar.gz/${entry.ver_id}`,
+      ]);
+      
+      const etagMatch = stdout.match(/ETag:\s*"([^"]+)"/i);
+      const currentHash = etagMatch ? etagMatch[1] : null;
+      
+      if (!lastInfo || lastInfo.hash !== currentHash) {
+        updates.push({
+          book: entry.book_id,
+          ver: entry.ver_id,
+          title: entry.title,
+          currentHash,
+          lastHash: lastInfo?.hash,
+        });
+      }
+    } catch {
+      continue;
+    }
+  }
+  
+  return updates;
+}
+
+export async function updateSyncManifestEntry(book, ver, hash) {
+  const manifest = await loadSyncManifest();
+  if (!manifest.books) manifest.books = {};
+  manifest.books[`${book}/${ver}`] = { hash, syncedAt: new Date().toISOString() };
+  await saveSyncManifest(new Date().toISOString(), manifest.books);
 }

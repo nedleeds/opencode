@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { CACHE, listCached, loadBookinfos, refreshBookinfos, syncBook, writeManifest } from './lib.js';
+import { CACHE, listCached, loadBookinfos, refreshBookinfos, syncBook, syncAllBooks, writeManifest, checkBookUpdates, loadSyncManifest, saveSyncManifest, checkoutBook } from './lib.js';
 
 /**
  * Sync is a separate CLI rather than a tool: it is slow, network-bound and run
@@ -20,6 +20,8 @@ function usage() {
 
   hrbook-sync --refresh              only re-fetch bookinfos.json
   hrbook-sync --defaults             refresh + sync a starter set of manuals
+  hrbook-sync --all                  sync ALL available manuals
+  hrbook-sync --check                check for updates to cached manuals
   hrbook-sync --list [filter]        list manuals available to sync
   hrbook-sync --status               show what is cached locally
   hrbook-sync <book_id> <ver_id>...  sync specific manuals
@@ -35,7 +37,7 @@ async function syncPairs(pairs) {
   for (const [book, ver] of pairs) {
     process.stdout.write(`  ${book}/${ver} ... `);
     try {
-      const n = await syncBook(book, ver);
+      const n = await syncBook(book, ver, true);
       console.log(`${n} pages`);
       done.push({ book, ver, pages: n });
       ok++;
@@ -75,12 +77,63 @@ try {
     process.exit(0);
   }
 
-  if (args[0] === '--refresh' || args[0] === '--defaults') {
+  if (args[0] === '--refresh' || args[0] === '--defaults' || args[0] === '--all') {
     console.log('bookinfos.json ...');
     console.log(`  ${await refreshBookinfos()} entries`);
     if (args[0] === '--refresh') process.exit(0);
+    
+    if (args[0] === '--all') {
+      const infos = await loadBookinfos();
+      const fetchable = infos.filter((e) => !e.url);
+      
+      const byBook = new Map();
+      for (const entry of fetchable) {
+        if (!byBook.has(entry.book_id)) {
+          byBook.set(entry.book_id, entry.ver_id);
+        }
+      }
+      
+      const manuals = [...byBook.entries()];
+      console.log(`\nSyncing ${manuals.length} manuals (first version of each)...`);
+      
+      let ok = 0;
+      let failed = 0;
+      
+      for (const [bookId, verId] of manuals) {
+        process.stdout.write(`  ${bookId}/${verId} ... `);
+        try {
+          const n = await syncBook(bookId, verId, true);
+          console.log(`${n} pages`);
+          ok++;
+        } catch (err) {
+          console.log(`FAILED`);
+          failed++;
+        }
+      }
+      
+      console.log(`\n${ok}/${manuals.length} synced`);
+      if (failed > 0) console.log(`${failed} failed`);
+      process.exit(failed > 0 ? 1 : 0);
+    }
+    
     console.log('manuals:');
     process.exit(await syncPairs(DEFAULTS));
+  }
+  
+  if (args[0] === '--check') {
+    console.log('Checking for updates...');
+    const updates = await checkBookUpdates();
+    if (updates.length === 0) {
+      console.log('All manuals are up to date.');
+      process.exit(0);
+    }
+    
+    console.log(`\n${updates.length} manual(s) have updates:`);
+    for (const update of updates) {
+      console.log(`  ${update.book}/${update.ver}: ${update.title}`);
+    }
+    console.log('\nRun `hrbook-sync --all` to update all manuals.');
+    process.exit(0);
   }
 
   if (args.length < 2 || args.length % 2 !== 0) {

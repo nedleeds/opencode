@@ -1,13 +1,14 @@
 import { readFile } from 'node:fs/promises';
+import { createInterface } from 'node:readline';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tool } from '../../tool.js';
-import { AUTOSYNC, listCached, loadBookinfos, rankBooks, readPage, searchWithAutoSync } from './lib.js';
+import { AUTOSYNC, listCached, loadBookinfos, rankBooks, readPage, searchWithAutoSync, checkBookUpdates, loadSyncManifest, checkoutBook, checkAllBooksUpdates, syncBook } from './lib.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const z = tool.schema;
 
-const TOOL_NAMES = ['hrbook_search', 'hrbook_read', 'hrbook_catalog'];
+const TOOL_NAMES = ['hrbook_search', 'hrbook_read', 'hrbook_catalog', 'hrbook_checkout'];
 
 /**
  * The agent ships with the plugin instead of living in each user's
@@ -38,20 +39,98 @@ async function agentConfig() {
   };
 }
 
-/**
- * Argument names mirror bookinfos.json and the viewer URLs (`book_id`,
- * `ver_id`) rather than shorter invented ones. Models reach for the domain's
- * own vocabulary, and a mismatch costs a failed call plus a retry on every
- * lookup — far more tokens than the longer names ever save.
- *
- * Tool descriptions sit in context on every request, so they stay to one line.
- */
+let autoSyncStarted = false;
+let syncInProgress = false;
+
+function askUser(question) {
+  return new Promise((resolve) => {
+    const rl = createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+    
+    rl.question(question + ' (y/n): ', (answer) => {
+      rl.close();
+      resolve(answer.toLowerCase().startsWith('y'));
+    });
+  });
+}
+
+async function handleInitialSync() {
+  if (autoSyncStarted || syncInProgress) return;
+  autoSyncStarted = true;
+  
+  try {
+    const updates = await checkAllBooksUpdates();
+    
+    if (updates.length === 0) return;
+    
+    const notCloned = updates.filter((u) => u.current === null);
+    const hasUpdates = updates.filter((u) => u.current !== null);
+    
+    if (notCloned.length > 0) {
+      console.error('\n[HRBook] 초기 동기화가 필요합니다.');
+      console.error(`  ${notCloned.length}개 매뉴얼을 다운로드할 예정입니다.`);
+      
+      const shouldSync = await askUser('동기화를 진행하시겠습니까?');
+      if (!shouldSync) return;
+      
+      syncInProgress = true;
+      console.error('\n동기화 중...');
+      
+      let synced = 0;
+      for (const update of notCloned) {
+        try {
+          await syncBook(update.book, update.target, true);
+          synced++;
+          process.stderr.write(`  ✓ ${update.book}\n`);
+        } catch (err) {
+          process.stderr.write(`  ✗ ${update.book}: ${err.message}\n`);
+        }
+      }
+      
+      console.error(`\n${synced}/${notCloned.length} 매뉴얼 동기화 완료.`);
+      syncInProgress = false;
+    }
+    
+    if (hasUpdates.length > 0) {
+      console.error('\n[HRBook] 업데이트된 매뉴얼이 있습니다.');
+      for (const update of hasUpdates.slice(0, 5)) {
+        console.error(`  - ${update.book} (${update.current} → ${update.target})`);
+      }
+      if (hasUpdates.length > 5) {
+        console.error(`  ... 그리고 ${hasUpdates.length - 5}개 더`);
+      }
+      
+      const shouldUpdate = await askUser('갱신하시겠습니까?');
+      if (!shouldUpdate) return;
+      
+      syncInProgress = true;
+      console.error('\n갱신 중...');
+      
+      let updated = 0;
+      for (const update of hasUpdates) {
+        try {
+          await checkoutBook(update.book, update.target);
+          updated++;
+          process.stderr.write(`  ✓ ${update.book}\n`);
+        } catch (err) {
+          process.stderr.write(`  ✗ ${update.book}: ${err.message}\n`);
+        }
+      }
+      
+      console.error(`\n${updated}/${hasUpdates.length} 매뉴얼 갱신 완료.`);
+      syncInProgress = false;
+    }
+  } catch (err) {
+    console.error('[HRBook] 자동 동기화 체크 실패:', err.message);
+  }
+}
+
 export const HrBookPlugin = async () => ({
   async config(cfg) {
     cfg.agent = cfg.agent ?? {};
 
-    // A user who has written their own `HRBook` agent meant it, so anything
-    // they set wins — down to the individual permission.
     const defaults = await agentConfig();
     const existing = cfg.agent.HRBook ?? {};
     cfg.agent.HRBook = {
@@ -60,10 +139,13 @@ export const HrBookPlugin = async () => ({
       permission: { ...defaults.permission, ...existing.permission },
     };
 
-    // Manual lookups have no place in a coding session, and an enabled tool
-    // costs its description in context on every single request. Off by
-    // default for the built-in agents, still overridable per user.
-    // Note: build/plan agents now have access to hrbook tools for manual-referencing tasks.
+    if (!autoSyncStarted) {
+      setTimeout(() => {
+        handleInitialSync().catch((err) => {
+          console.error('[HRBook] Auto-sync check failed:', err.message);
+        });
+      }, 1000);
+    }
   },
 
   tool: {
@@ -124,6 +206,7 @@ export const HrBookPlugin = async () => ({
         maxBytes: z.number().int().min(500).max(40000).optional().describe('Default 12000'),
       },
       async execute(args) {
+        await checkoutBook(args.book_id, args.ver_id);
         const { text, truncated, url } = await readPage(
           args.book_id,
           args.ver_id,
@@ -131,6 +214,19 @@ export const HrBookPlugin = async () => ({
           args.maxBytes,
         );
         return `${url}\n\n${text}${truncated ? '\n\n[truncated — raise maxBytes for more]' : ''}`;
+      },
+    }),
+
+    hrbook_checkout: tool({
+      description:
+        'Checkout a specific branch (language/version) of a cloned manual. Use when you need to switch to a different language.',
+      args: {
+        book_id: z.string().describe('e.g. doc-hi6-open-api'),
+        ver_id: z.string().describe('e.g. en, ko, en-tp630'),
+      },
+      async execute(args) {
+        await checkoutBook(args.book_id, args.ver_id);
+        return `Checked out ${args.book_id} to branch ${args.ver_id}`;
       },
     }),
 
