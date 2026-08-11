@@ -565,6 +565,23 @@ export async function checkAllBooksUpdates() {
   return updates;
 }
 
+let pendingSyncCount = 0;
+
+export async function checkPendingSync() {
+  if (pendingSyncCount > 0) return pendingSyncCount;
+  try {
+    const updates = await checkAllBooksUpdates();
+    pendingSyncCount = updates.length;
+    return pendingSyncCount;
+  } catch {
+    return 0;
+  }
+}
+
+export function resetPendingSync() {
+  pendingSyncCount = 0;
+}
+
 export async function writeManifest(entries) {
   await writeFile(
     path.join(CACHE, 'manifest.json'),
