@@ -2,12 +2,20 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tool } from '../../tool.js';
-import { AUTOSYNC, listCached, loadBookinfos, rankBooks, readPage, searchWithAutoSync, checkoutBook, checkAllBooksUpdates, syncBook } from './lib.js';
+import {
+  AUTOSYNC,
+  listCached,
+  loadBookinfos,
+  rankBooks,
+  readPage,
+  searchWithAutoSync,
+  checkoutBook,
+  checkAllBooksUpdates,
+  syncBook,
+} from './lib.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const z = tool.schema;
-
-const TOOL_NAMES = ['hrbook_search', 'hrbook_read', 'hrbook_catalog', 'hrbook_checkout'];
 
 /**
  * The agent ships with the plugin instead of living in each user's
@@ -38,272 +46,230 @@ async function agentConfig() {
   };
 }
 
-let autoSyncStarted = false;
-let syncInProgress = false;
+/** Toast every N books rather than every book — the TUI queues them otherwise. */
+const PROGRESS_EVERY = 5;
 
-function askUser(question) {
-  return new Promise((resolve) => {
-    process.stderr.write('\n' + question + ' (y/n): ');
-    
-    const onData = (data) => {
-      const answer = data.toString().trim().toLowerCase();
-      process.stdin.removeListener('data', onData);
-      resolve(answer.startsWith('y'));
-    };
-    
-    process.stdin.once('data', onData);
-    
-    setTimeout(() => {
-      process.stdin.removeListener('data', onData);
-      resolve(false);
-    }, 30000);
-  });
-}
+export const HrBookPlugin = async ({ client }) => {
+  /**
+   * One entry point for the initial sync, guarded by one flag.
+   *
+   * The previous version had two: a `setTimeout` fired from `config`, and an
+   * inline block at the top of `hrbook_search`. The search path never checked
+   * the flag the timer set, so both could run `syncBook` against the same git
+   * repo at once and collide on `index.lock`.
+   */
+  let syncStarted = false;
 
-async function handleInitialSync() {
-  if (autoSyncStarted || syncInProgress) return;
-  autoSyncStarted = true;
-  
-  try {
-    const updates = await checkAllBooksUpdates();
-    
-    if (updates.length === 0) return;
-    
-    const notCloned = updates.filter((u) => u.current === null);
-    const hasUpdates = updates.filter((u) => u.current !== null);
-    
-    if (notCloned.length > 0) {
-      console.error('\n[HRBook] 초기 동기화가 필요합니다.');
-      console.error(`  ${notCloned.length}개 매뉴얼을 다운로드할 예정입니다.`);
-      
-      const shouldSync = await askUser('동기화를 진행하시겠습니까?');
-      if (!shouldSync) return;
-      
-      syncInProgress = true;
-      console.error('\n동기화 중...');
-      
-      let synced = 0;
-      for (const update of notCloned) {
+  /**
+   * `client.tui.*` reaches the TUI over the server's HTTP API, so it throws
+   * whenever no TUI is attached — `opencode run`, `serve`, `web`, `attach`.
+   * That must not take the sync down with it, hence the swallow.
+   */
+  const toast = async (message, variant = 'info') => {
+    try {
+      await client.tui.showToast({ body: { message, variant } });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  /** `console.log` from a plugin goes nowhere useful; this lands in the logs. */
+  const log = (message, level = 'info') =>
+    client.app.log({ body: { service: 'hrbook', level, message } }).catch(() => {});
+
+  async function runInitialSync() {
+    if (syncStarted) return;
+    syncStarted = true;
+
+    try {
+      const updates = await checkAllBooksUpdates();
+      const notCloned = updates.filter((u) => u.current === null);
+      if (notCloned.length === 0) {
+        await log('initial sync: nothing to clone');
+        return;
+      }
+
+      await toast(`매뉴얼 ${notCloned.length}개 동기화를 시작합니다`, 'info');
+      await log(`initial sync: ${notCloned.length} book(s) to clone`);
+
+      let ok = 0;
+      let fail = 0;
+      for (const u of notCloned) {
         try {
-          await syncBook(update.book, update.target, true);
-          synced++;
-          process.stderr.write(`  ✓ ${update.book}\n`);
+          await syncBook(u.book, u.target, true);
+          ok++;
         } catch (err) {
-          process.stderr.write(`  ✗ ${update.book}: ${err.message}\n`);
+          fail++;
+          await log(`sync failed ${u.book}/${u.target}: ${err.message}`, 'warn');
+        }
+        if ((ok + fail) % PROGRESS_EVERY === 0) {
+          await toast(`동기화 ${ok + fail}/${notCloned.length}`, 'info');
         }
       }
-      
-      console.error(`\n${synced}/${notCloned.length} 매뉴얼 동기화 완료.`);
-      syncInProgress = false;
+
+      await toast(
+        `동기화 완료 — 성공 ${ok}건, 실패 ${fail}건`,
+        fail > 0 ? 'error' : 'success',
+      );
+      await log(`initial sync done: ${ok} ok, ${fail} failed`);
+    } catch (err) {
+      await toast(`동기화 확인 실패: ${err.message}`, 'error');
+      await log(`initial sync aborted: ${err.message}`, 'error');
     }
-    
-    if (hasUpdates.length > 0) {
-      console.error('\n[HRBook] 업데이트된 매뉴얼이 있습니다.');
-      for (const update of hasUpdates.slice(0, 5)) {
-        console.error(`  - ${update.book} (${update.current} → ${update.target})`);
-      }
-      if (hasUpdates.length > 5) {
-        console.error(`  ... 그리고 ${hasUpdates.length - 5}개 더`);
-      }
-      
-      const shouldUpdate = await askUser('갱신하시겠습니까?');
-      if (!shouldUpdate) return;
-      
-      syncInProgress = true;
-      console.error('\n갱신 중...');
-      
-      let updated = 0;
-      for (const update of hasUpdates) {
-        try {
-          await checkoutBook(update.book, update.target);
-          updated++;
-          process.stderr.write(`  ✓ ${update.book}\n`);
-        } catch (err) {
-          process.stderr.write(`  ✗ ${update.book}: ${err.message}\n`);
-        }
-      }
-      
-      console.error(`\n${updated}/${hasUpdates.length} 매뉴얼 갱신 완료.`);
-      syncInProgress = false;
-    }
-  } catch (err) {
-    console.error('[HRBook] 자동 동기화 체크 실패:', err.message);
   }
-}
 
-export const HrBookPlugin = async () => ({
-  async config(cfg) {
-    cfg.agent = cfg.agent ?? {};
+  return {
+    async config(cfg) {
+      cfg.agent = cfg.agent ?? {};
 
-    const defaults = await agentConfig();
-    const existing = cfg.agent.HRBook ?? {};
-    cfg.agent.HRBook = {
-      ...defaults,
-      ...existing,
-      permission: { ...defaults.permission, ...existing.permission },
-    };
+      const defaults = await agentConfig();
+      const existing = cfg.agent.HRBook ?? {};
+      cfg.agent.HRBook = {
+        ...defaults,
+        ...existing,
+        permission: { ...defaults.permission, ...existing.permission },
+      };
 
-    if (!autoSyncStarted) {
-      setTimeout(() => {
-        handleInitialSync().catch((err) => {
-          process.stderr.write('[HRBook] Auto-sync check failed: ' + err.message + '\n');
-        });
-      }, 10000);
-    }
-  },
+      // No side effects here. `config` runs while opencode resolves its
+      // configuration, before the TUI has connected to the server, so a toast
+      // fired from this point has no client to reach and is dropped.
+    },
 
-  tool: {
-    hrbook_search: tool({
-      description:
-        'Search cached HD Hyundai Robotics Hi6/Hi7 controller manuals. Returns book_id, ver_id, page path, heading, snippet and viewer link.',
-      args: {
-        query: z.string().describe('Keywords only, e.g. "api_ver" or "조그 속도"'),
-        product: z.enum(['hi6', 'hi7', 'hi5a', 'common', 'manipulator']).optional(),
-        lang: z.string().optional().describe('Language prefix of ver_id: ko, en, zh'),
-        book_id: z.string().optional().describe('Restrict to one book, e.g. doc-hi6-open-api'),
-        limit: z.number().int().min(1).max(20).optional().describe('Default 8'),
-      },
-      async execute(args, ctx) {
-        // Probe: check ctx structure
-        try {
-          await ctx.log({
-            service: 'hrbook-probe',
-            level: 'info',
-            message: 'ctx keys: ' + JSON.stringify(Object.keys(ctx)),
+    async event({ event }) {
+      if (syncStarted) return;
+      if (event.type !== 'session.created' && event.type !== 'session.updated') return;
+
+      // Deliberately not awaited. The event hook runs inline in opencode's
+      // event pipeline; awaiting a multi-minute git clone here freezes the TUI.
+      void runInitialSync();
+    },
+
+    tool: {
+      hrbook_search: tool({
+        description:
+          'Search cached HD Hyundai Robotics Hi6/Hi7 controller manuals. Returns book_id, ver_id, page path, heading, snippet and viewer link.',
+        args: {
+          query: z.string().describe('Keywords only, e.g. "api_ver" or "조그 속도"'),
+          product: z.enum(['hi6', 'hi7', 'hi5a', 'common', 'manipulator']).optional(),
+          lang: z.string().optional().describe('Language prefix of ver_id: ko, en, zh'),
+          book_id: z.string().optional().describe('Restrict to one book, e.g. doc-hi6-open-api'),
+          limit: z.number().int().min(1).max(20).optional().describe('Default 8'),
+        },
+        async execute(args) {
+          // No sync here. Cloning every manual inside the first search blocks
+          // the model for the whole download; the `event` hook owns that now.
+          const { hits, scanned, total, synced } = await searchWithAutoSync(args.query, {
+            product: args.product,
+            lang: args.lang,
+            book: args.book_id,
+            limit: args.limit,
           });
-        } catch {}
-        
-        // First call: check and sync if needed
-        try {
-          const updates = await checkAllBooksUpdates();
-          if (updates.length > 0) {
-            const notCloned = updates.filter((u) => u.current === null);
-            if (notCloned.length > 0) {
-              // Use stderr for visible output in TUI
-              process.stderr.write(`\n[HRBook] ${notCloned.length}개 매뉴얼 동기화 중...\n`);
-              
-              let synced = 0;
-              let failed = 0;
-              for (const update of notCloned) {
-                try {
-                  await syncBook(update.book, update.target, true);
-                  synced++;
-                } catch (err) {
-                  failed++;
-                }
-              }
-              
-              process.stderr.write(`[HRBook] 완료: ${synced}개 성공, ${failed}개 실패\n\n`);
+
+          if (hits.length === 0) {
+            const cached = await listCached();
+            if (cached.length === 0) {
+              return syncStarted
+                ? 'Manuals are still syncing. Ask the user to retry in a moment.'
+                : 'No manuals cached. Run `hrbook-sync --defaults` first.';
             }
+            // Spell out the boundary. Left to a bare "no match", models fill the
+            // gap from training data and invent page paths and viewer links —
+            // for controller manuals that is worse than saying nothing.
+            const list = cached.map((c) => `${c.book}/${c.ver}`).join(', ');
+            return [
+              `No match for "${args.query}" in ${scanned} pages.`,
+              AUTOSYNC
+                ? 'Auto-sync found no manual to fetch for these keywords.'
+                : 'Auto-sync is disabled (HRBOOK_AUTOSYNC=0).',
+              `Cached manuals: ${list}.`,
+              'Retry ONCE with fewer keywords. If it still misses, use hrbook_catalog to find the right',
+              'manual, then tell the user to run `hrbook-sync <book_id> <ver_id>`.',
+              'Do NOT answer from memory and do NOT invent page paths or viewer links.',
+            ].join('\n');
           }
-        } catch (err) {
-          // Silent
-        }
-        
-        const { hits, scanned, total, synced } = await searchWithAutoSync(args.query, {
-          product: args.product,
-          lang: args.lang,
-          book: args.book_id,
-          limit: args.limit,
-        });
-        if (hits.length === 0) {
-          const cached = await listCached();
-          if (cached.length === 0) return 'No manuals cached. Run `hrbook-sync --defaults` first.';
-          // Spell out the boundary. Left to a bare "no match", models fill the
-          // gap from training data and invent page paths and viewer links —
-          // for controller manuals that is worse than saying nothing.
-          const list = cached.map((c) => `${c.book}/${c.ver}`).join(', ');
-          return [
-            `No match for "${args.query}" in ${scanned} pages.`,
-            AUTOSYNC
-              ? 'Auto-sync found no manual to fetch for these keywords.'
-              : 'Auto-sync is disabled (HRBOOK_AUTOSYNC=0).',
-            `Cached manuals: ${list}.`,
-            'Retry ONCE with fewer keywords. If it still misses, use hrbook_catalog to find the right',
-            'manual, then tell the user to run `hrbook-sync <book_id> <ver_id>`.',
-            'Do NOT answer from memory and do NOT invent page paths or viewer links.',
-          ].join('\n');
-        }
-        const body = hits
-          .map(
-            (h) =>
-              `- book_id=${h.book} ver_id=${h.ver} path=${h.path}\n  ${h.heading || h.title}\n  ${h.snippet}\n  ${h.url}`,
-          )
-          .join('\n');
-        const note = synced?.length ? `(auto-synced ${synced.join(', ')})\n` : '';
-        const more = total > hits.length ? `\n(${total - hits.length} more)` : '';
-        return `${note}${hits.length}/${total} match(es) in ${scanned} pages:\n${body}${more}`;
-      },
-    }),
 
-    hrbook_read: tool({
-      description:
-        'Read one cached manual page as markdown. Use book_id/ver_id/path exactly as returned by hrbook_search.',
-      args: {
-        book_id: z.string().describe('e.g. doc-hi6-open-api'),
-        ver_id: z.string().describe('e.g. en, ko, en-tp630'),
-        path: z.string().describe('e.g. 1-version/1-get/1-api_ver.md'),
-        maxBytes: z.number().int().min(500).max(40000).optional().describe('Default 12000'),
-      },
-      async execute(args) {
-        await checkoutBook(args.book_id, args.ver_id);
-        const { text, truncated, url } = await readPage(
-          args.book_id,
-          args.ver_id,
-          args.path,
-          args.maxBytes,
-        );
-        return `${url}\n\n${text}${truncated ? '\n\n[truncated — raise maxBytes for more]' : ''}`;
-      },
-    }),
+          const body = hits
+            .map(
+              (h) =>
+                `- book_id=${h.book} ver_id=${h.ver} path=${h.path}\n  ${h.heading || h.title}\n  ${h.snippet}\n  ${h.url}`,
+            )
+            .join('\n');
+          const note = synced?.length ? `(auto-synced ${synced.join(', ')})\n` : '';
+          const more = total > hits.length ? `\n(${total - hits.length} more)` : '';
+          return `${note}${hits.length}/${total} match(es) in ${scanned} pages:\n${body}${more}`;
+        },
+      }),
 
-    hrbook_checkout: tool({
-      description:
-        'Checkout a specific branch (language/version) of a cloned manual. Use when you need to switch to a different language.',
-      args: {
-        book_id: z.string().describe('e.g. doc-hi6-open-api'),
-        ver_id: z.string().describe('e.g. en, ko, en-tp630'),
-      },
-      async execute(args) {
-        await checkoutBook(args.book_id, args.ver_id);
-        return `Checked out ${args.book_id} to branch ${args.ver_id}`;
-      },
-    }),
+      hrbook_read: tool({
+        description:
+          'Read one cached manual page as markdown. Use book_id/ver_id/path exactly as returned by hrbook_search.',
+        args: {
+          book_id: z.string().describe('e.g. doc-hi6-open-api'),
+          ver_id: z.string().describe('e.g. en, ko, en-tp630'),
+          path: z.string().describe('e.g. 1-version/1-get/1-api_ver.md'),
+          maxBytes: z.number().int().min(500).max(40000).optional().describe('Default 12000'),
+        },
+        async execute(args) {
+          await checkoutBook(args.book_id, args.ver_id);
+          const { text, truncated, url } = await readPage(
+            args.book_id,
+            args.ver_id,
+            args.path,
+            args.maxBytes,
+          );
+          return `${url}\n\n${text}${truncated ? '\n\n[truncated — raise maxBytes for more]' : ''}`;
+        },
+      }),
 
-    /**
-     * The full catalogue is ~5.4k tokens, so it is never put in the system
-     * prompt. It is reachable here, filtered, and only when the code-side
-     * matching in hrbook_search has already failed — a rare path.
-     */
-    hrbook_catalog: tool({
-      description:
-        'Find which manual covers a topic when hrbook_search misses. Lists matching book_id/ver_id from the full catalogue, and marks what is cached.',
-      args: {
-        filter: z
-          .string()
-          .describe('Keyword matched against book_id and title, e.g. "weld" or "통신"'),
-        product: z.enum(['hi6', 'hi7', 'hi5a', 'common', 'manipulator']).optional(),
-        lang: z.string().optional().describe('Language prefix of ver_id: ko, en, zh'),
-      },
-      async execute(args) {
-        const infos = await loadBookinfos();
-        const cached = new Set((await listCached()).map((c) => `${c.book}/${c.ver}`));
-        const ranked = rankBooks(args.filter, infos, {
-          product: args.product,
-          lang: args.lang,
-          limit: 15,
-        });
-        if (ranked.length === 0) return `No manual matches "${args.filter}".`;
-        const rows = ranked
-          .map((e) => {
-            const key = `${e.book_id}/${e.ver_id}`;
-            return `- book_id=${e.book_id} ver_id=${e.ver_id}${cached.has(key) ? ' [cached]' : ''} — ${e.title}`;
-          })
-          .join('\n');
-        return `${ranked.length} manual(s) matching "${args.filter}":\n${rows}\n\nUncached ones are fetched automatically on the next hrbook_search, or run \`hrbook-sync <book_id> <ver_id>\`.`;
-      },
-    }),
-  },
-});
+      hrbook_checkout: tool({
+        description:
+          'Checkout a specific branch (language/version) of a cloned manual. Use when you need to switch to a different language.',
+        args: {
+          book_id: z.string().describe('e.g. doc-hi6-open-api'),
+          ver_id: z.string().describe('e.g. en, ko, en-tp630'),
+        },
+        async execute(args) {
+          await checkoutBook(args.book_id, args.ver_id);
+          return `Checked out ${args.book_id} to branch ${args.ver_id}`;
+        },
+      }),
+
+      /**
+       * The full catalogue is ~5.4k tokens, so it is never put in the system
+       * prompt. It is reachable here, filtered, and only when the code-side
+       * matching in hrbook_search has already failed — a rare path.
+       */
+      hrbook_catalog: tool({
+        description:
+          'Find which manual covers a topic when hrbook_search misses. Lists matching book_id/ver_id from the full catalogue, and marks what is cached.',
+        args: {
+          filter: z
+            .string()
+            .describe('Keyword matched against book_id and title, e.g. "weld" or "통신"'),
+          product: z.enum(['hi6', 'hi7', 'hi5a', 'common', 'manipulator']).optional(),
+          lang: z.string().optional().describe('Language prefix of ver_id: ko, en, zh'),
+        },
+        async execute(args) {
+          const infos = await loadBookinfos();
+          const cached = new Set((await listCached()).map((c) => `${c.book}/${c.ver}`));
+          const ranked = rankBooks(args.filter, infos, {
+            product: args.product,
+            lang: args.lang,
+            limit: 15,
+          });
+          if (ranked.length === 0) return `No manual matches "${args.filter}".`;
+          const rows = ranked
+            .map((e) => {
+              const key = `${e.book_id}/${e.ver_id}`;
+              return `- book_id=${e.book_id} ver_id=${e.ver_id}${cached.has(key) ? ' [cached]' : ''} — ${e.title}`;
+            })
+            .join('\n');
+          return `${ranked.length} manual(s) matching "${args.filter}":\n${rows}\n\nUncached ones are fetched automatically on the next hrbook_search, or run \`hrbook-sync <book_id> <ver_id>\`.`;
+        },
+      }),
+    },
+  };
+};
 
 export default HrBookPlugin;
