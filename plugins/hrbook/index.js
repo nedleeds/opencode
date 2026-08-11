@@ -1,10 +1,12 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tool } from '../../tool.js';
 import {
   AUTOSYNC,
   CACHE,
+  isBookComplete,
   listCached,
   loadBookinfos,
   rankBooks,
@@ -22,10 +24,22 @@ const z = tool.schema;
  * Where the sidebar — or anything else outside this process — reads progress
  * from. A TUI sidebar cannot be shipped from here (opencode's external TUI
  * plugin layer does not reliably load), so the state is published as a file
- * instead and whatever renders it can be swapped later without touching this
+ * and whatever renders it can be swapped in later without touching this
  * plugin.
  */
 const STATUS_FILE = path.join(CACHE, 'sync-status.json');
+
+/**
+ * Guards the cache against two opencode instances syncing at once. `gitLock`
+ * below only serialises within one process; two terminals both start with
+ * `syncStarted = false` and would clone into the same directory.
+ *
+ * Refreshed as each book starts, so a crash leaves a lock that expires rather
+ * than one that blocks forever. The TTL has to exceed the slowest single book;
+ * with the `--depth 1` fetch in lib.js that is well under a minute.
+ */
+const LOCK_FILE = path.join(CACHE, 'sync.lock');
+const LOCK_TTL_MS = 10 * 60 * 1000;
 
 async function agentConfig() {
   return {
@@ -115,22 +129,55 @@ export const HrBookPlugin = async ({ client }) => {
     }
   }
 
+  async function touchLock() {
+    try {
+      await mkdir(CACHE, { recursive: true });
+      await writeFile(
+        LOCK_FILE,
+        JSON.stringify({ pid: process.pid, at: Date.now() }),
+        'utf8',
+      );
+    } catch {
+      // Losing the lock file degrades to the old behaviour; it must not throw.
+    }
+  }
+
+  /** False when another live instance already holds the lock. */
+  async function acquireLock() {
+    try {
+      const held = JSON.parse(await readFile(LOCK_FILE, 'utf8'));
+      if (held.pid !== process.pid && Date.now() - held.at < LOCK_TTL_MS) return false;
+    } catch {
+      // Absent, unreadable or corrupt — treat as free.
+    }
+    await touchLock();
+    return true;
+  }
+
+  const releaseLock = () => rm(LOCK_FILE, { force: true }).catch(() => {});
+
   /**
-   * Books present in the catalogue but absent from the cache — computed from
-   * the local filesystem only, no network.
+   * Books in the catalogue that are not yet completely on disk — read from the
+   * local filesystem only, no network.
    *
-   * The previous version called `checkAllBooksUpdates()` here, which runs a
-   * `git fetch` plus two `rev-parse` per already-cloned book, in series. On a
-   * corporate network that is minutes of silence before the first toast even
-   * fires. Update checking belongs in `hrbook-sync --check`, not at startup.
+   * Completeness comes from `isBookComplete()` (the `.hrbook-ok` marker) and
+   * not from `listCached()`. A clone interrupted partway leaves a valid `.git`
+   * with an empty working tree, which `listCached()` happily reports as a
+   * cached book — so the book would be skipped on every subsequent run and
+   * never become searchable. Quitting mid-sync is expected here, so this has
+   * to be the durable check.
+   *
+   * The previous version also called `checkAllBooksUpdates()` at this point,
+   * which runs a `git fetch` plus two `rev-parse` per already-cloned book, in
+   * series. On a corporate network that is minutes of silence before the first
+   * toast fires. Update checking belongs in `hrbook-sync --check`, not startup.
    */
   async function missingBooks() {
     const infos = await loadBookinfos();
-    const cached = new Set((await listCached()).map((c) => c.book));
     const byBook = new Map();
     for (const e of infos) {
       if (e.url) continue; // content lives at an external URL, not fetchable
-      if (cached.has(e.book_id)) continue;
+      if (isBookComplete(e.book_id)) continue;
       if (!byBook.has(e.book_id)) byBook.set(e.book_id, e.ver_id);
     }
     return [...byBook.entries()].map(([book, ver]) => ({ book, ver }));
@@ -140,10 +187,17 @@ export const HrBookPlugin = async ({ client }) => {
     if (syncStarted) return;
     syncStarted = true;
 
+    let holdsLock = false;
     try {
       const missing = await missingBooks();
       if (missing.length === 0) {
         await log('initial sync: nothing missing');
+        return;
+      }
+
+      holdsLock = await acquireLock();
+      if (!holdsLock) {
+        await log('initial sync skipped: another opencode instance holds the lock');
         return;
       }
 
@@ -161,11 +215,12 @@ export const HrBookPlugin = async ({ client }) => {
       await publishStatus();
 
       await toast(`매뉴얼 ${missing.length}개 다운로드를 시작합니다`, 'info');
-      await log(`initial sync: ${missing.length} book(s) missing`);
+      await log(`initial sync: ${missing.length} book(s) incomplete`);
 
       for (const { book, ver } of missing) {
         const n = progress.done + progress.failed + 1;
         progress.current = book;
+        await touchLock();
         await publishStatus();
         await toast(`내려받는 중 (${n}/${progress.total}) — ${book}`, 'info');
 
@@ -197,10 +252,10 @@ export const HrBookPlugin = async ({ client }) => {
       await publishStatus();
       await toast(`동기화 준비 실패: ${err.message}`, 'error');
       await log(`initial sync aborted: ${err.message}`, 'error');
+    } finally {
+      if (holdsLock) await releaseLock();
     }
   }
-
-  const isCached = async (book) => (await listCached()).some((c) => c.book === book);
 
   const stillSyncing = (book) =>
     `${book} 는 아직 내려받는 중입니다 (${progress.done + progress.failed}/${progress.total}). ` +
@@ -316,7 +371,7 @@ export const HrBookPlugin = async ({ client }) => {
           maxBytes: z.number().int().min(500).max(40000).optional().describe('Default 12000'),
         },
         async execute(args) {
-          if (progress.active && !(await isCached(args.book_id))) {
+          if (progress.active && !isBookComplete(args.book_id)) {
             return stillSyncing(args.book_id);
           }
           await withGitLock(() => checkoutBook(args.book_id, args.ver_id));
@@ -338,7 +393,7 @@ export const HrBookPlugin = async ({ client }) => {
           ver_id: z.string().describe('e.g. en, ko, en-tp630'),
         },
         async execute(args) {
-          if (progress.active && !(await isCached(args.book_id))) {
+          if (progress.active && !isBookComplete(args.book_id)) {
             return stillSyncing(args.book_id);
           }
           await withGitLock(() => checkoutBook(args.book_id, args.ver_id));
@@ -387,10 +442,17 @@ export const HrBookPlugin = async ({ client }) => {
         async execute() {
           const cached = await listCached();
           if (!progress.active) {
-            const tail = progress.failedBooks.length
-              ? `\n실패: ${progress.failedBooks.join(', ')}`
-              : '';
-            return `동기화 진행 중이 아닙니다. 캐시된 매뉴얼 ${cached.length}개.${tail}\n캐시 위치: ${CACHE}`;
+            const incomplete = await missingBooks();
+            const lines = [
+              `동기화 진행 중이 아닙니다. 캐시된 매뉴얼 ${cached.length}개.`,
+              incomplete.length
+                ? `미완료 ${incomplete.length}개: ${incomplete.map((m) => m.book).join(', ')}`
+                : null,
+              progress.failedBooks.length ? `직전 실패: ${progress.failedBooks.join(', ')}` : null,
+              existsSync(LOCK_FILE) ? '다른 opencode 인스턴스가 동기화 중일 수 있습니다.' : null,
+              `캐시 위치: ${CACHE}`,
+            ];
+            return lines.filter(Boolean).join('\n');
           }
           const seen = progress.done + progress.failed;
           return [

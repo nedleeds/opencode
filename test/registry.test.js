@@ -17,8 +17,10 @@ test('registers every plugin tool under plugins/', async () => {
   const hooks = await plugin({}, {});
   assert.deepEqual(Object.keys(hooks.tool ?? {}).sort(), [
     'hrbook_catalog',
+    'hrbook_checkout',
     'hrbook_read',
     'hrbook_search',
+    'hrbook_status',
   ]);
 });
 

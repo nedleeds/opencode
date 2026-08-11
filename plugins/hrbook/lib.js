@@ -485,6 +485,25 @@ async function gitEnsureBranch(dest, branch) {
   }
 }
 
+/**
+ * Written only once a book is fully cloned, checked out and confirmed to hold
+ * markdown.
+ *
+ * Without it an interrupted clone is indistinguishable from a finished one:
+ * `gitClone` uses `--no-checkout`, so killing opencode between the clone and
+ * `gitEnsureBranch` leaves a valid `.git` on disk with no pages in the working
+ * tree. `listCached()` then counts that book as present and the initial sync
+ * skips it forever — the book silently never becomes searchable. Interrupting
+ * is the normal case here, not the rare one: a full sync runs for tens of
+ * minutes and the whole point of the redesign is that the user can keep
+ * working (and therefore keep quitting) while it does.
+ */
+const MARKER = '.hrbook-ok';
+
+export function isBookComplete(book) {
+  return existsSync(path.join(BOOKS_DIR, book, MARKER));
+}
+
 export async function syncBook(book, ver, useGit = false) {
   const dest = path.join(BOOKS_DIR, book);
 
@@ -493,8 +512,17 @@ export async function syncBook(book, ver, useGit = false) {
       await gitClone(book, dest);
     }
     await gitEnsureBranch(dest, ver);
-    
+
     const pages = await walkMarkdown(dest);
+    // A checkout that produced no markdown is a failure, not a completed book.
+    if (pages.length === 0) {
+      throw new Error(`${book}/${ver}: checkout produced no markdown`);
+    }
+    await writeFile(
+      path.join(dest, MARKER),
+      JSON.stringify({ ver, pages: pages.length, at: new Date().toISOString() }),
+      'utf8',
+    );
     return pages.length;
   } else {
     const tmp = path.join(CACHE, '.tmp', `${book}-${ver}`);
