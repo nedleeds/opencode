@@ -44,15 +44,20 @@ let syncInProgress = false;
 
 function askUser(question) {
   return new Promise((resolve) => {
-    const rl = createInterface({
-      input: process.stdin,
-      output: process.stdout,
-    });
+    process.stderr.write('\n' + question + ' (y/n): ');
     
-    rl.question(question + ' (y/n): ', (answer) => {
-      rl.close();
-      resolve(answer.toLowerCase().startsWith('y'));
-    });
+    const onData = (data) => {
+      const answer = data.toString().trim().toLowerCase();
+      process.stdin.removeListener('data', onData);
+      resolve(answer.startsWith('y'));
+    };
+    
+    process.stdin.once('data', onData);
+    
+    setTimeout(() => {
+      process.stdin.removeListener('data', onData);
+      resolve(false);
+    }, 30000);
   });
 }
 
