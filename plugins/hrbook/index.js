@@ -74,44 +74,34 @@ async function handleInitialSync() {
     const hasUpdates = updates.filter((u) => u.current !== null);
     
     if (notCloned.length > 0) {
-      process.stderr.write(`\n[HRBook] ${notCloned.length}개 매뉴얼을 자동 동기화합니다...\n`);
-      
       syncInProgress = true;
       let synced = 0;
       for (const update of notCloned) {
         try {
           await syncBook(update.book, update.target, true);
           synced++;
-          process.stderr.write(`  ✓ ${update.book}\n`);
         } catch (err) {
-          process.stderr.write(`  ✗ ${update.book}: ${err.message}\n`);
+          // Silent fail
         }
       }
-      
-      process.stderr.write(`\n[HRBook] ${synced}/${notCloned.length} 매뉴얼 동기화 완료.\n\n`);
       syncInProgress = false;
     }
     
     if (hasUpdates.length > 0) {
-      process.stderr.write(`\n[HRBook] ${hasUpdates.length}개 매뉴얼을 갱신합니다...\n`);
-      
       syncInProgress = true;
       let updated = 0;
       for (const update of hasUpdates) {
         try {
           await checkoutBook(update.book, update.target);
           updated++;
-          process.stderr.write(`  ✓ ${update.book}\n`);
         } catch (err) {
-          process.stderr.write(`  ✗ ${update.book}: ${err.message}\n`);
+          // Silent fail
         }
       }
-      
-      process.stderr.write(`\n[HRBook] ${updated}/${hasUpdates.length} 매뉴얼 갱신 완료.\n\n`);
       syncInProgress = false;
     }
   } catch (err) {
-    process.stderr.write('[HRBook] 자동 동기화 체크 실패: ' + err.message + '\n');
+    // Silent
   }
 }
 
