@@ -400,6 +400,94 @@ export async function searchWithAutoSync(query, opts = {}) {
   return { ...second, synced };
 }
 
+// ------------------------------------------------------- remote fallback
+//
+// A book that is still downloading used to make the tools answer "not cached",
+// which leaves the user's actual question unanswered for however long the
+// clone takes. The manuals are plain markdown in public repos, so a single
+// page can be fetched over HTTP without any clone at all. That turns the wait
+// into a slower answer instead of no answer, and once the clone lands the
+// same tools silently go back to reading from disk.
+
+const RAW_BASE =
+  process.env.HRBOOK_RAW_BASE || 'https://raw.githubusercontent.com/hyundai-robotics';
+
+export function rawUrl(book, ver, relPath) {
+  const rel = relPath.replace(/\\/g, '/').replace(/^\/+/, '');
+  return `${RAW_BASE}/${book}/${ver}/${rel}`;
+}
+
+/** curl to a temp file and read it back — same proxy/CA handling as download(). */
+async function fetchText(url) {
+  const tmp = path.join(CACHE, '.tmp', `fetch-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  try {
+    await download(url, tmp);
+    return await readText(tmp);
+  } finally {
+    await rm(tmp, { force: true });
+  }
+}
+
+/** SUMMARY.md is the GitBook table of contents: one markdown link per page. */
+export function parseToc(text) {
+  const entries = [];
+  const re = /\[([^\]]+)\]\(([^)]+\.md)\)/g;
+  let m;
+  while ((m = re.exec(text))) {
+    const p = m[2].trim();
+    if (/^https?:/i.test(p)) continue;
+    entries.push({ title: m[1].trim(), path: p.replace(/^\.\//, '') });
+  }
+  return entries;
+}
+
+const tocCache = new Map();
+
+export async function remoteToc(book, ver) {
+  const key = `${book}/${ver}`;
+  if (tocCache.has(key)) return tocCache.get(key);
+
+  const entries = parseToc(await fetchText(rawUrl(book, ver, 'SUMMARY.md')));
+  tocCache.set(key, entries);
+  return entries;
+}
+
+/** Title/path matching against the remote TOC. Deliberately not full text —
+ *  one HTTP round trip, not one per page. */
+export async function remoteSearch(query, book, ver, limit = 5) {
+  const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+  if (terms.length === 0) return [];
+  const entries = await remoteToc(book, ver);
+
+  const scored = [];
+  for (const e of entries) {
+    const hay = `${e.title} ${e.path}`.toLowerCase();
+    const score = terms.reduce((n, t) => n + (hay.includes(t) ? 1 : 0), 0);
+    if (score > 0) scored.push({ ...e, score });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, limit);
+}
+
+export async function readRemotePage(book, ver, relPath, maxBytes = 12000) {
+  const rel = relPath.endsWith('.md') ? relPath : `${relPath}.md`;
+  const infos = await loadBookinfos();
+  const info = meta(infos, book, ver);
+
+  let text = substitute(await fetchText(rawUrl(book, ver, rel)), info?.variables);
+  let truncated = false;
+  if (text.length > maxBytes) {
+    text = text.slice(0, maxBytes);
+    truncated = true;
+  }
+  return {
+    text,
+    truncated,
+    url: viewerUrl(book, ver, rel, info?.variables?.cont_model),
+    remote: true,
+  };
+}
+
 export async function readPage(book, ver, relPath, maxBytes = 12000) {
   const rel = relPath.endsWith('.md') ? relPath : `${relPath}.md`;
   
@@ -459,11 +547,16 @@ async function gitCheckout(dest, branch) {
   await run('git', ['-C', dest, 'checkout', branch]);
 }
 
-async function gitEnsureBranch(dest, branch) {
+async function gitEnsureBranch(dest, branch, { force = false } = {}) {
   try {
     const { stdout: current } = await run('git', ['-C', dest, 'branch', '--show-current']);
     const currentBranch = current.trim();
-    if (currentBranch === branch) return;
+    // `force` is set right after a clone. `gitClone` uses `--no-checkout`, so
+    // HEAD already names a branch while the working tree is still empty — and
+    // when `ver` happens to equal the repo's default branch, the early return
+    // below would skip the checkout entirely and leave a book with no markdown
+    // in it. That used to pass silently; `syncBook` now rejects it.
+    if (!force && currentBranch === branch) return;
     
     await run('git', ['-C', dest, 'fetch', 'origin', `refs/heads/${branch}:refs/remotes/origin/${branch}`]);
     await run('git', ['-C', dest, 'checkout', branch]);
@@ -508,16 +601,40 @@ export async function syncBook(book, ver, useGit = false) {
   const dest = path.join(BOOKS_DIR, book);
 
   if (useGit) {
-    if (!existsSync(dest)) {
-      await gitClone(book, dest);
+    // A directory without `.git` is debris, not a repo.
+    if (existsSync(dest) && !existsSync(path.join(dest, '.git'))) {
+      await rm(dest, { recursive: true, force: true });
     }
-    await gitEnsureBranch(dest, ver);
 
-    const pages = await walkMarkdown(dest);
-    // A checkout that produced no markdown is a failure, not a completed book.
+    const fresh = !existsSync(dest);
+    if (fresh) await gitClone(book, dest);
+
+    // Anything without the marker is either brand new or an interrupted
+    // clone, and both leave an empty working tree behind `--no-checkout`.
+    // Forcing the checkout is what repairs the interrupted case: without it
+    // `gitEnsureBranch` sees HEAD already naming the wanted branch and returns
+    // without ever populating the tree, so the book fails on every retry
+    // forever. Quitting mid-clone is normal here, so this path has to heal.
+    let pages = [];
+    try {
+      await gitEnsureBranch(dest, ver, { force: true });
+      pages = await walkMarkdown(dest);
+    } catch {
+      pages = [];
+    }
+
+    // Still empty — the repo itself is damaged. Throw it away and start over.
+    if (pages.length === 0) {
+      await rm(dest, { recursive: true, force: true });
+      await gitClone(book, dest);
+      await gitEnsureBranch(dest, ver, { force: true });
+      pages = await walkMarkdown(dest);
+    }
+
     if (pages.length === 0) {
       throw new Error(`${book}/${ver}: checkout produced no markdown`);
     }
+
     await writeFile(
       path.join(dest, MARKER),
       JSON.stringify({ ver, pages: pages.length, at: new Date().toISOString() }),

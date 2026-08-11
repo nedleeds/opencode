@@ -13,8 +13,35 @@ const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
  * failure has to be caught here instead.
  */
 
+/**
+ * The plugin takes `{ client }` and uses it for toasts and structured logs.
+ * Passing a stub keeps the tests off the real SDK, and the calls it records
+ * let a test assert on what the user would have been shown.
+ */
+function stubClient() {
+  const toasts = [];
+  const logs = [];
+  return {
+    toasts,
+    logs,
+    tui: {
+      showToast: async ({ body }) => {
+        toasts.push(body);
+        return true;
+      },
+    },
+    app: {
+      log: async ({ body }) => {
+        logs.push(body);
+      },
+    },
+  };
+}
+
+const load = (client = stubClient()) => plugin({ client }, {});
+
 test('registers every plugin tool under plugins/', async () => {
-  const hooks = await plugin({}, {});
+  const hooks = await load();
   assert.deepEqual(Object.keys(hooks.tool ?? {}).sort(), [
     'hrbook_catalog',
     'hrbook_checkout',
@@ -24,8 +51,16 @@ test('registers every plugin tool under plugins/', async () => {
   ]);
 });
 
-test('the same hook declared twice runs both times, not just the last', async () => {
+test('loads even when the host passes no client', async () => {
+  // opencode calls the factory with a context object, but a bare call must not
+  // take the plugin down: `client.app.log` at load time would throw before a
+  // single tool is registered, and opencode reports that as nothing at all.
   const hooks = await plugin({}, {});
+  assert.ok(hooks.tool?.hrbook_search, 'tools still registered without a client');
+});
+
+test('the same hook declared twice runs both times, not just the last', async () => {
+  const hooks = await load();
   // `config` comes from hrbook and from the skills registration in index.js —
   // the merge has to chain them, not let one overwrite the other.
   const cfg = {};
@@ -35,7 +70,7 @@ test('the same hook declared twice runs both times, not just the last', async ()
 });
 
 test('config hook contributes the hrbook agent with its prompt inlined', async () => {
-  const hooks = await plugin({}, {});
+  const hooks = await load();
   const cfg = {};
   await hooks.config(cfg);
 
@@ -48,7 +83,7 @@ test('config hook contributes the hrbook agent with its prompt inlined', async (
 });
 
 test('the agent carries no `name` field — the key is the name', async () => {
-  const hooks = await plugin({}, {});
+  const hooks = await load();
   const cfg = {};
   await hooks.config(cfg);
 
@@ -58,8 +93,28 @@ test('the agent carries no `name` field — the key is the name', async () => {
   assert.equal(cfg.agent.HRBook.name, undefined);
 });
 
+test('the config hook downloads nothing', async () => {
+  // Caching is on demand now: it starts from a question, never from startup.
+  // A toast or a git call fired here is the old bulk-sync behaviour coming
+  // back, which is what blocked the TUI for minutes before anyone could type.
+  const client = stubClient();
+  const hooks = await load(client);
+  await hooks.config({});
+  await new Promise((r) => setTimeout(r, 50));
+
+  assert.deepEqual(client.toasts, [], 'no download toasts from config');
+});
+
+test('the plugin exposes no event hook', async () => {
+  // `session.created` fires on the first prompt rather than at startup, so
+  // driving downloads from events made them wait for the user to type. The
+  // trigger is the search tool now.
+  const hooks = await load();
+  assert.equal(hooks.event, undefined);
+});
+
 test('build/plan agents now have access to hrbook tools, and user settings still win', async () => {
-  const hooks = await plugin({}, {});
+  const hooks = await load();
   const cfg = {
     agent: {
       build: { permission: { hrbook_search: 'allow' } },
@@ -79,7 +134,7 @@ test('build/plan agents now have access to hrbook tools, and user settings still
 });
 
 test('skills directory is registered once, alongside any the user configured', async () => {
-  const hooks = await plugin({}, {});
+  const hooks = await load();
   const cfg = { skills: { paths: ['.opencode/skills'] } };
   await hooks.config(cfg);
   await hooks.config(cfg);

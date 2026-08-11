@@ -1,9 +1,14 @@
 import assert from 'node:assert/strict';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { test } from 'node:test';
 import {
   langKeyForTest,
   matchesLangForTest,
+  parseToc,
   rankBooks,
+  rawUrl,
   substitute,
   viewerUrl,
 } from '../plugins/hrbook/lib.js';
@@ -88,4 +93,74 @@ test('rankBooks honours the product filter', () => {
 
 test('rankBooks returns nothing for a query of only stopword-length tokens', () => {
   assert.deepEqual(rankBooks('a b', INFOS), []);
+});
+
+// ------------------------------------------------------- remote fallback
+
+test('rawUrl builds a raw content path and normalises separators', () => {
+  assert.equal(
+    rawUrl('doc-hi6-open-api', 'ko', '1-version/1-get/1-api_ver.md'),
+    'https://raw.githubusercontent.com/hyundai-robotics/doc-hi6-open-api/ko/1-version/1-get/1-api_ver.md',
+  );
+  // Paths come back from Windows filesystem walks with backslashes.
+  assert.equal(
+    rawUrl('b', 'ko', '1-a\\2-b.md'),
+    'https://raw.githubusercontent.com/hyundai-robotics/b/ko/1-a/2-b.md',
+  );
+});
+
+test('parseToc pulls every page out of a GitBook SUMMARY.md', () => {
+  // This is what lets an uncached manual still answer a question: one HTTP
+  // round trip yields every page path, so hrbook_read has somewhere to go.
+  const summary = [
+    '# Table of contents',
+    '',
+    '* [${cont_model} 제어기](README.md)',
+    '  * [사전 주의사항](0-about-this-manual/precautions.md)',
+    '* [1.1.1 api_ver](./1-version/1-get/1-api_ver.md)',
+    '* [외부 링크](https://example.com/x.md)',
+    '* [이미지](assets/diagram.png)',
+  ].join('\n');
+
+  assert.deepEqual(parseToc(summary), [
+    { title: '${cont_model} 제어기', path: 'README.md' },
+    { title: '사전 주의사항', path: '0-about-this-manual/precautions.md' },
+    { title: '1.1.1 api_ver', path: '1-version/1-get/1-api_ver.md' },
+  ]);
+});
+
+test('parseToc tolerates a BOM and returns nothing for an empty summary', () => {
+  assert.deepEqual(parseToc('\uFEFF# Table of contents\n'), []);
+});
+
+// ------------------------------------------------------- completion marker
+
+test('a book counts as cached only once the marker is written', async () => {
+  // The failure this guards: quitting mid-clone leaves a valid `.git` with an
+  // empty working tree. Judged by directory presence that looks cached, so the
+  // book is skipped forever and silently never becomes searchable.
+  const cache = await mkdtemp(path.join(tmpdir(), 'hrbook-test-'));
+  try {
+    process.env.HRBOOK_CACHE = cache;
+    // Imported after the env var is set — CACHE is resolved at module load.
+    const { isBookComplete, BOOKS_DIR } = await import(
+      `../plugins/hrbook/lib.js?cache=${encodeURIComponent(cache)}`
+    );
+
+    assert.equal(isBookComplete('doc-hi6-open-api'), false, 'nothing on disk');
+
+    // An interrupted clone: repo present, working tree empty, no marker.
+    await mkdir(path.join(BOOKS_DIR, 'doc-hi6-open-api', '.git'), { recursive: true });
+    assert.equal(isBookComplete('doc-hi6-open-api'), false, 'interrupted clone is not cached');
+
+    await writeFile(
+      path.join(BOOKS_DIR, 'doc-hi6-open-api', '.hrbook-ok'),
+      JSON.stringify({ ver: 'ko', pages: 109 }),
+      'utf8',
+    );
+    assert.equal(isBookComplete('doc-hi6-open-api'), true, 'marker means cached');
+  } finally {
+    delete process.env.HRBOOK_CACHE;
+    await rm(cache, { recursive: true, force: true });
+  }
 });
