@@ -1,9 +1,8 @@
 import { readFile } from 'node:fs/promises';
-import { createInterface } from 'node:readline';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tool } from '../../tool.js';
-import { AUTOSYNC, listCached, loadBookinfos, rankBooks, readPage, searchWithAutoSync, checkBookUpdates, loadSyncManifest, checkoutBook, checkAllBooksUpdates, syncBook } from './lib.js';
+import { AUTOSYNC, listCached, loadBookinfos, rankBooks, readPage, searchWithAutoSync, checkoutBook, checkAllBooksUpdates, syncBook } from './lib.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const z = tool.schema;
@@ -164,14 +163,21 @@ export const HrBookPlugin = async () => ({
         book_id: z.string().optional().describe('Restrict to one book, e.g. doc-hi6-open-api'),
         limit: z.number().int().min(1).max(20).optional().describe('Default 8'),
       },
-      async execute(args) {
+      async execute(args, ctx) {
         // First call: check and sync if needed
         try {
           const updates = await checkAllBooksUpdates();
           if (updates.length > 0) {
             const notCloned = updates.filter((u) => u.current === null);
             if (notCloned.length > 0) {
-              process.stderr.write(`\n[HRBook] ${notCloned.length}개 매뉴얼 동기화 중...\n`);
+              // Use TUI toast notification
+              await ctx.client?.tui?.showToast?.({
+                body: {
+                  message: `${notCloned.length}개 매뉴얼 동기화 중...`,
+                  variant: 'info',
+                },
+              }).catch(() => {});
+              
               let synced = 0;
               let failed = 0;
               for (const update of notCloned) {
@@ -180,10 +186,15 @@ export const HrBookPlugin = async () => ({
                   synced++;
                 } catch (err) {
                   failed++;
-                  process.stderr.write(`  ✗ ${update.book}: ${err.message.split('\n')[0]}\n`);
                 }
               }
-              process.stderr.write(`[HRBook] 완료: ${synced}개 성공, ${failed}개 실패\n\n`);
+              
+              await ctx.client?.tui?.showToast?.({
+                body: {
+                  message: `동기화 완료: ${synced}개 성공, ${failed}개 실패`,
+                  variant: failed > 0 ? 'error' : 'success',
+                },
+              }).catch(() => {});
             }
           }
         } catch (err) {
