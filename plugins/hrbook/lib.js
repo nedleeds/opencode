@@ -14,7 +14,26 @@ const run = promisify(execFile);
  * github.com may be slow, proxied, or blocked outright — and it means a single
  * person can sync once and share the cache directory with the whole team.
  */
-export const CACHE = process.env.HRBOOK_CACHE || path.join(homedir(), '.cache', 'hrbook');
+/**
+ * On Windows the cache goes on D: rather than C:. These repos carry their full
+ * git history and grow into the gigabytes, and C: is where the corporate image
+ * is tightest. `HRBOOK_CACHE` still wins, `HRBOOK_CACHE_DRIVE` picks a
+ * different drive, and a machine without that drive falls back to the home
+ * directory — so a laptop keeps working with no configuration.
+ */
+function defaultCache() {
+  if (process.env.HRBOOK_CACHE) return process.env.HRBOOK_CACHE;
+  if (process.platform === 'win32') {
+    const drive = process.env.HRBOOK_CACHE_DRIVE || 'D:';
+    // `path.join('D:', ...)` resolves against the CWD on that drive; the
+    // trailing separator is what makes it the drive root.
+    const root = drive.endsWith(path.sep) ? drive : drive + path.sep;
+    if (existsSync(root)) return path.join(root, '.cache', 'hrbook');
+  }
+  return path.join(homedir(), '.cache', 'hrbook');
+}
+
+export const CACHE = defaultCache();
 export const BOOKS_DIR = path.join(CACHE, 'books');
 export const BOOKINFOS = path.join(CACHE, 'bookinfos.json');
 export const SYNC_MANIFEST = path.join(CACHE, 'sync-manifest.json');
@@ -449,8 +468,15 @@ async function gitEnsureBranch(dest, branch) {
     await run('git', ['-C', dest, 'fetch', 'origin', `refs/heads/${branch}:refs/remotes/origin/${branch}`]);
     await run('git', ['-C', dest, 'checkout', branch]);
   } catch {
-    await run('git', ['-C', dest, 'fetch', '--unshallow']);
-    await run('git', ['-C', dest, 'fetch', 'origin', `refs/heads/${branch}:refs/remotes/origin/${branch}`]);
+    // Not `--unshallow`. The clone above is `--depth 1`; unshallowing pulls the
+    // entire history of a manual repo back down, which is minutes per book on a
+    // proxied network — and this catch is reached by any branch-name mismatch,
+    // so it is the common path rather than the rare one. One shallow ref is all
+    // a checkout needs.
+    await run('git', [
+      '-C', dest, 'fetch', '--depth', '1', 'origin',
+      `refs/heads/${branch}:refs/remotes/origin/${branch}`,
+    ]);
     try {
       await run('git', ['-C', dest, 'checkout', '-b', branch, `origin/${branch}`]);
     } catch (err) {
@@ -611,10 +637,14 @@ export async function syncAllBooks(progressCallback) {
   const cached = await listCached();
   const cachedKeys = new Set(cached.map((c) => `${c.book}/${c.ver}`));
   
-  const fetchable = infos.filter(fetchable);
-  
+  // `const fetchable = infos.filter(fetchable)` shadowed the module-level
+  // helper with a const in the same scope, so the initialiser referenced the
+  // binding inside its own TDZ and every call threw
+  // `ReferenceError: Cannot access 'fetchable' before initialization`.
+  const targets = infos.filter((e) => fetchable(e));
+
   const byBook = new Map();
-  for (const entry of fetchable) {
+  for (const entry of targets) {
     if (!byBook.has(entry.book_id)) {
       byBook.set(entry.book_id, new Set());
     }

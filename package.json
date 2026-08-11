@@ -1,6 +1,6 @@
 {
   "name": "@hdr/hrbook",
-  "version": "0.1.18",
+  "version": "0.1.19",
   "publishConfig": {
     "registry": "http://10.130.91.186:4873/"
   },

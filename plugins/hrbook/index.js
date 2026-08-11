@@ -1,16 +1,17 @@
-import { readFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tool } from '../../tool.js';
 import {
   AUTOSYNC,
+  CACHE,
   listCached,
   loadBookinfos,
   rankBooks,
   readPage,
+  search,
   searchWithAutoSync,
   checkoutBook,
-  checkAllBooksUpdates,
   syncBook,
 } from './lib.js';
 
@@ -18,15 +19,14 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const z = tool.schema;
 
 /**
- * The agent ships with the plugin instead of living in each user's
- * opencode.jsonc. Tools and the prompt that drives them are one unit — a
- * prompt that names `hrbook_read` is wrong the moment the tool is renamed —
- * and keeping them together is what reduces installation to one link.
- *
- * The prompt is read here rather than passed as `{file:...}`, because that
- * template resolves against the *user's* config directory, which this file
- * knows nothing about.
+ * Where the sidebar — or anything else outside this process — reads progress
+ * from. A TUI sidebar cannot be shipped from here (opencode's external TUI
+ * plugin layer does not reliably load), so the state is published as a file
+ * instead and whatever renders it can be swapped later without touching this
+ * plugin.
  */
+const STATUS_FILE = path.join(CACHE, 'sync-status.json');
+
 async function agentConfig() {
   return {
     // No `name` field — the key under `cfg.agent` is the agent's name, and a
@@ -40,84 +40,183 @@ async function agentConfig() {
     // derived from its permission ruleset (Permission.visibleTools), and the
     // `tools` shorthand is folded into permissions while the config documents
     // are parsed — before any plugin runs. A `tools` map set from here is
-    // therefore read by nobody and silently does nothing. `edit` is the
-    // permission behind write/edit/patch alike.
+    // therefore read by nobody and silently does nothing.
     permission: { edit: 'deny', bash: 'deny' },
   };
 }
 
-/** Toast every N books rather than every book — the TUI queues them otherwise. */
-const PROGRESS_EVERY = 5;
+/**
+ * Every git invocation in this plugin queues behind the previous one.
+ *
+ * Without it the background sync and a tool call reach the same
+ * `books/<book>/.git` at the same time, collide on `index.lock`, and the tool
+ * call stalls — which is what the model renders as an endless "Thinking".
+ * Serial git costs nothing here: these are network-bound clones against one
+ * host, and running them in parallel mostly multiplies the proxy's load.
+ */
+let gitLock = Promise.resolve();
+function withGitLock(fn) {
+  const run = gitLock.then(fn, fn);
+  gitLock = run.then(
+    () => {},
+    () => {},
+  );
+  return run;
+}
+
+/** Shared between the background sync and every tool, so a tool can answer
+ *  "still downloading" instantly instead of blocking on a clone. */
+const progress = {
+  active: false,
+  total: 0,
+  done: 0,
+  failed: 0,
+  current: null,
+  finished: [],
+  failedBooks: [],
+  startedAt: null,
+  finishedAt: null,
+};
 
 export const HrBookPlugin = async ({ client }) => {
-  /**
-   * One entry point for the initial sync, guarded by one flag.
-   *
-   * The previous version had two: a `setTimeout` fired from `config`, and an
-   * inline block at the top of `hrbook_search`. The search path never checked
-   * the flag the timer set, so both could run `syncBook` against the same git
-   * repo at once and collide on `index.lock`.
-   */
   let syncStarted = false;
 
   /**
-   * `client.tui.*` reaches the TUI over the server's HTTP API, so it throws
-   * whenever no TUI is attached — `opencode run`, `serve`, `web`, `attach`.
-   * That must not take the sync down with it, hence the swallow.
+   * `client.tui.*` reaches the TUI over the server's HTTP API and therefore
+   * throws whenever no TUI is attached — `opencode run`, `serve`, `web`,
+   * `attach`. One failure disables it for the rest of the process rather than
+   * paying a failed round trip on every book.
    */
+  let tuiAlive = true;
   const toast = async (message, variant = 'info') => {
+    if (!tuiAlive) return false;
     try {
       await client.tui.showToast({ body: { message, variant } });
       return true;
     } catch {
+      tuiAlive = false;
       return false;
     }
   };
 
-  /** `console.log` from a plugin goes nowhere useful; this lands in the logs. */
   const log = (message, level = 'info') =>
     client.app.log({ body: { service: 'hrbook', level, message } }).catch(() => {});
+
+  async function publishStatus() {
+    try {
+      await mkdir(path.dirname(STATUS_FILE), { recursive: true });
+      await writeFile(
+        STATUS_FILE,
+        JSON.stringify({ ...progress, updatedAt: new Date().toISOString() }, null, 2),
+        'utf8',
+      );
+    } catch {
+      // A missing status file must never break the sync.
+    }
+  }
+
+  /**
+   * Books present in the catalogue but absent from the cache — computed from
+   * the local filesystem only, no network.
+   *
+   * The previous version called `checkAllBooksUpdates()` here, which runs a
+   * `git fetch` plus two `rev-parse` per already-cloned book, in series. On a
+   * corporate network that is minutes of silence before the first toast even
+   * fires. Update checking belongs in `hrbook-sync --check`, not at startup.
+   */
+  async function missingBooks() {
+    const infos = await loadBookinfos();
+    const cached = new Set((await listCached()).map((c) => c.book));
+    const byBook = new Map();
+    for (const e of infos) {
+      if (e.url) continue; // content lives at an external URL, not fetchable
+      if (cached.has(e.book_id)) continue;
+      if (!byBook.has(e.book_id)) byBook.set(e.book_id, e.ver_id);
+    }
+    return [...byBook.entries()].map(([book, ver]) => ({ book, ver }));
+  }
 
   async function runInitialSync() {
     if (syncStarted) return;
     syncStarted = true;
 
     try {
-      const updates = await checkAllBooksUpdates();
-      const notCloned = updates.filter((u) => u.current === null);
-      if (notCloned.length === 0) {
-        await log('initial sync: nothing to clone');
+      const missing = await missingBooks();
+      if (missing.length === 0) {
+        await log('initial sync: nothing missing');
         return;
       }
 
-      await toast(`매뉴얼 ${notCloned.length}개 동기화를 시작합니다`, 'info');
-      await log(`initial sync: ${notCloned.length} book(s) to clone`);
+      Object.assign(progress, {
+        active: true,
+        total: missing.length,
+        done: 0,
+        failed: 0,
+        current: null,
+        finished: [],
+        failedBooks: [],
+        startedAt: new Date().toISOString(),
+        finishedAt: null,
+      });
+      await publishStatus();
 
-      let ok = 0;
-      let fail = 0;
-      for (const u of notCloned) {
+      await toast(`매뉴얼 ${missing.length}개 다운로드를 시작합니다`, 'info');
+      await log(`initial sync: ${missing.length} book(s) missing`);
+
+      for (const { book, ver } of missing) {
+        const n = progress.done + progress.failed + 1;
+        progress.current = book;
+        await publishStatus();
+        await toast(`내려받는 중 (${n}/${progress.total}) — ${book}`, 'info');
+
         try {
-          await syncBook(u.book, u.target, true);
-          ok++;
+          await withGitLock(() => syncBook(book, ver, true));
+          progress.done++;
+          progress.finished.push(book);
         } catch (err) {
-          fail++;
-          await log(`sync failed ${u.book}/${u.target}: ${err.message}`, 'warn');
+          progress.failed++;
+          progress.failedBooks.push(book);
+          await log(`sync failed ${book}/${ver}: ${err.message}`, 'warn');
         }
-        if ((ok + fail) % PROGRESS_EVERY === 0) {
-          await toast(`동기화 ${ok + fail}/${notCloned.length}`, 'info');
-        }
+        await publishStatus();
       }
 
+      progress.current = null;
+      progress.active = false;
+      progress.finishedAt = new Date().toISOString();
+      await publishStatus();
+
       await toast(
-        `동기화 완료 — 성공 ${ok}건, 실패 ${fail}건`,
-        fail > 0 ? 'error' : 'success',
+        `동기화 완료 — 성공 ${progress.done}건, 실패 ${progress.failed}건`,
+        progress.failed > 0 ? 'error' : 'success',
       );
-      await log(`initial sync done: ${ok} ok, ${fail} failed`);
+      await log(`initial sync done: ${progress.done} ok, ${progress.failed} failed`);
     } catch (err) {
-      await toast(`동기화 확인 실패: ${err.message}`, 'error');
+      progress.active = false;
+      progress.current = null;
+      await publishStatus();
+      await toast(`동기화 준비 실패: ${err.message}`, 'error');
       await log(`initial sync aborted: ${err.message}`, 'error');
     }
   }
+
+  const isCached = async (book) => (await listCached()).some((c) => c.book === book);
+
+  const stillSyncing = (book) =>
+    `${book} 는 아직 내려받는 중입니다 (${progress.done + progress.failed}/${progress.total}). ` +
+    `잠시 후 다시 시도하거나, 이미 받아진 다른 매뉴얼로 답하세요.`;
+
+  /**
+   * Any event that can only fire once a client is attached. Several are listed
+   * because which one arrives first varies by opencode version, and the
+   * `syncStarted` flag makes the extras free.
+   */
+  const TRIGGERS = new Set([
+    'server.connected',
+    'session.created',
+    'session.updated',
+    'message.updated',
+  ]);
 
   return {
     async config(cfg) {
@@ -132,16 +231,15 @@ export const HrBookPlugin = async ({ client }) => {
       };
 
       // No side effects here. `config` runs while opencode resolves its
-      // configuration, before the TUI has connected to the server, so a toast
-      // fired from this point has no client to reach and is dropped.
+      // configuration, before any client has connected, so a toast fired from
+      // this point has nowhere to go.
     },
 
     async event({ event }) {
       if (syncStarted) return;
-      if (event.type !== 'session.created' && event.type !== 'session.updated') return;
-
-      // Deliberately not awaited. The event hook runs inline in opencode's
-      // event pipeline; awaiting a multi-minute git clone here freezes the TUI.
+      if (!TRIGGERS.has(event.type)) return;
+      // Deliberately not awaited: this hook runs inline in opencode's event
+      // pipeline, and awaiting a multi-minute clone here freezes the TUI.
       void runInitialSync();
     },
 
@@ -157,31 +255,38 @@ export const HrBookPlugin = async ({ client }) => {
           limit: z.number().int().min(1).max(20).optional().describe('Default 8'),
         },
         async execute(args) {
-          // No sync here. Cloning every manual inside the first search blocks
-          // the model for the whole download; the `event` hook owns that now.
-          const { hits, scanned, total, synced } = await searchWithAutoSync(args.query, {
+          const opts = {
             product: args.product,
             lang: args.lang,
             book: args.book_id,
             limit: args.limit,
-          });
+          };
+
+          // While the background sync holds the git lock, search the local
+          // cache only. `searchWithAutoSync` would queue behind the clone and
+          // hang the turn for as long as the download takes.
+          const { hits, scanned, total, synced } = progress.active
+            ? await search(args.query, opts)
+            : await searchWithAutoSync(args.query, opts);
 
           if (hits.length === 0) {
             const cached = await listCached();
             if (cached.length === 0) {
-              return syncStarted
-                ? 'Manuals are still syncing. Ask the user to retry in a moment.'
+              return progress.active
+                ? `아직 받아진 매뉴얼이 없습니다. 동기화 진행 중 (${progress.done + progress.failed}/${progress.total}). 사용자에게 잠시 후 다시 시도해 달라고 안내하세요.`
                 : 'No manuals cached. Run `hrbook-sync --defaults` first.';
             }
-            // Spell out the boundary. Left to a bare "no match", models fill the
-            // gap from training data and invent page paths and viewer links —
-            // for controller manuals that is worse than saying nothing.
+            // Spell out the boundary. Left to a bare "no match", models fill
+            // the gap from training data and invent page paths and viewer
+            // links — for controller manuals that is worse than saying nothing.
             const list = cached.map((c) => `${c.book}/${c.ver}`).join(', ');
             return [
               `No match for "${args.query}" in ${scanned} pages.`,
-              AUTOSYNC
-                ? 'Auto-sync found no manual to fetch for these keywords.'
-                : 'Auto-sync is disabled (HRBOOK_AUTOSYNC=0).',
+              progress.active
+                ? `Sync in progress (${progress.done + progress.failed}/${progress.total}); more manuals become searchable shortly.`
+                : AUTOSYNC
+                  ? 'Auto-sync found no manual to fetch for these keywords.'
+                  : 'Auto-sync is disabled (HRBOOK_AUTOSYNC=0).',
               `Cached manuals: ${list}.`,
               'Retry ONCE with fewer keywords. If it still misses, use hrbook_catalog to find the right',
               'manual, then tell the user to run `hrbook-sync <book_id> <ver_id>`.',
@@ -211,7 +316,10 @@ export const HrBookPlugin = async ({ client }) => {
           maxBytes: z.number().int().min(500).max(40000).optional().describe('Default 12000'),
         },
         async execute(args) {
-          await checkoutBook(args.book_id, args.ver_id);
+          if (progress.active && !(await isCached(args.book_id))) {
+            return stillSyncing(args.book_id);
+          }
+          await withGitLock(() => checkoutBook(args.book_id, args.ver_id));
           const { text, truncated, url } = await readPage(
             args.book_id,
             args.ver_id,
@@ -230,7 +338,10 @@ export const HrBookPlugin = async ({ client }) => {
           ver_id: z.string().describe('e.g. en, ko, en-tp630'),
         },
         async execute(args) {
-          await checkoutBook(args.book_id, args.ver_id);
+          if (progress.active && !(await isCached(args.book_id))) {
+            return stillSyncing(args.book_id);
+          }
+          await withGitLock(() => checkoutBook(args.book_id, args.ver_id));
           return `Checked out ${args.book_id} to branch ${args.ver_id}`;
         },
       }),
@@ -266,6 +377,32 @@ export const HrBookPlugin = async ({ client }) => {
             })
             .join('\n');
           return `${ranked.length} manual(s) matching "${args.filter}":\n${rows}\n\nUncached ones are fetched automatically on the next hrbook_search, or run \`hrbook-sync <book_id> <ver_id>\`.`;
+        },
+      }),
+
+      hrbook_status: tool({
+        description:
+          '매뉴얼 동기화 진행 상황을 조회한다. 사용자가 진행률·남은 개수·실패 여부를 물을 때 사용.',
+        args: {},
+        async execute() {
+          const cached = await listCached();
+          if (!progress.active) {
+            const tail = progress.failedBooks.length
+              ? `\n실패: ${progress.failedBooks.join(', ')}`
+              : '';
+            return `동기화 진행 중이 아닙니다. 캐시된 매뉴얼 ${cached.length}개.${tail}\n캐시 위치: ${CACHE}`;
+          }
+          const seen = progress.done + progress.failed;
+          return [
+            `동기화 진행 중: ${seen}/${progress.total}`,
+            progress.current ? `현재 내려받는 중: ${progress.current}` : null,
+            progress.finished.length ? `완료: ${progress.finished.join(', ')}` : null,
+            progress.failedBooks.length ? `실패: ${progress.failedBooks.join(', ')}` : null,
+            `검색 가능한 매뉴얼: ${cached.length}개`,
+            `상태 파일: ${STATUS_FILE}`,
+          ]
+            .filter(Boolean)
+            .join('\n');
         },
       }),
     },
