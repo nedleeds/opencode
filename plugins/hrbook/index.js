@@ -164,19 +164,23 @@ export const HrBookPlugin = async () => ({
         limit: z.number().int().min(1).max(20).optional().describe('Default 8'),
       },
       async execute(args, ctx) {
+        // Probe: check ctx structure
+        try {
+          await ctx.log({
+            service: 'hrbook-probe',
+            level: 'info',
+            message: 'ctx keys: ' + JSON.stringify(Object.keys(ctx)),
+          });
+        } catch {}
+        
         // First call: check and sync if needed
         try {
           const updates = await checkAllBooksUpdates();
           if (updates.length > 0) {
             const notCloned = updates.filter((u) => u.current === null);
             if (notCloned.length > 0) {
-              // Use TUI toast notification
-              await ctx.client?.tui?.showToast?.({
-                body: {
-                  message: `${notCloned.length}개 매뉴얼 동기화 중...`,
-                  variant: 'info',
-                },
-              }).catch(() => {});
+              // Use stderr for visible output in TUI
+              process.stderr.write(`\n[HRBook] ${notCloned.length}개 매뉴얼 동기화 중...\n`);
               
               let synced = 0;
               let failed = 0;
@@ -189,12 +193,7 @@ export const HrBookPlugin = async () => ({
                 }
               }
               
-              await ctx.client?.tui?.showToast?.({
-                body: {
-                  message: `동기화 완료: ${synced}개 성공, ${failed}개 실패`,
-                  variant: failed > 0 ? 'error' : 'success',
-                },
-              }).catch(() => {});
+              process.stderr.write(`[HRBook] 완료: ${synced}개 성공, ${failed}개 실패\n\n`);
             }
           }
         } catch (err) {
