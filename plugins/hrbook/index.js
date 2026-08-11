@@ -147,9 +147,9 @@ export const HrBookPlugin = async () => ({
     if (!autoSyncStarted) {
       setTimeout(() => {
         handleInitialSync().catch((err) => {
-          console.error('[HRBook] Auto-sync check failed:', err.message);
+          process.stderr.write('[HRBook] Auto-sync check failed: ' + err.message + '\n');
         });
-      }, 1000);
+      }, 10000);
     }
   },
 
