@@ -74,34 +74,42 @@ async function handleInitialSync() {
     const hasUpdates = updates.filter((u) => u.current !== null);
     
     if (notCloned.length > 0) {
+      process.stderr.write(`\n[HRBook] ${notCloned.length}개 매뉴얼 동기화 중...\n`);
       syncInProgress = true;
       let synced = 0;
+      let failed = 0;
       for (const update of notCloned) {
         try {
           await syncBook(update.book, update.target, true);
           synced++;
         } catch (err) {
-          // Silent fail
+          failed++;
+          process.stderr.write(`  ✗ ${update.book}: ${err.message.split('\n')[0]}\n`);
         }
       }
       syncInProgress = false;
+      process.stderr.write(`[HRBook] 완료: ${synced}개 성공, ${failed}개 실패\n\n`);
     }
     
     if (hasUpdates.length > 0) {
+      process.stderr.write(`\n[HRBook] ${hasUpdates.length}개 매뉴얼 갱신 중...\n`);
       syncInProgress = true;
       let updated = 0;
+      let failed = 0;
       for (const update of hasUpdates) {
         try {
           await checkoutBook(update.book, update.target);
           updated++;
         } catch (err) {
-          // Silent fail
+          failed++;
+          process.stderr.write(`  ✗ ${update.book}: ${err.message.split('\n')[0]}\n`);
         }
       }
       syncInProgress = false;
+      process.stderr.write(`[HRBook] 완료: ${updated}개 성공, ${failed}개 실패\n\n`);
     }
   } catch (err) {
-    // Silent
+    process.stderr.write(`[HRBook] 체크 실패: ${err.message}\n`);
   }
 }
 
