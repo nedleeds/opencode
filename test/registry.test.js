@@ -56,19 +56,21 @@ test('the agent carries no `name` field — the key is the name', async () => {
   assert.equal(cfg.agent.HRBook.name, undefined);
 });
 
-test('manual tools stay off in coding agents, and user settings still win', async () => {
+test('build/plan agents now have access to hrbook tools, and user settings still win', async () => {
   const hooks = await plugin({}, {});
   const cfg = {
     agent: {
       build: { permission: { hrbook_search: 'allow' } },
+      plan: { permission: { hrbook_catalog: 'allow' } },
       HRBook: { permission: { bash: 'allow' } },
     },
   };
   await hooks.config(cfg);
 
   assert.equal(cfg.agent.build.permission.hrbook_search, 'allow', 'user value must survive');
-  assert.equal(cfg.agent.build.permission.hrbook_read, 'deny');
-  assert.equal(cfg.agent.plan.permission.hrbook_catalog, 'deny');
+  assert.equal(cfg.agent.build.permission.hrbook_read, undefined, 'no longer denied by default');
+  assert.equal(cfg.agent.plan.permission.hrbook_catalog, 'allow', 'user value must survive');
+  assert.equal(cfg.agent.plan.permission.hrbook_search, undefined, 'no longer denied by default');
 
   assert.equal(cfg.agent.HRBook.permission.bash, 'allow', 'user value must survive');
   assert.equal(cfg.agent.HRBook.permission.edit, 'deny', 'untouched defaults stay');

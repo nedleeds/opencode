@@ -63,13 +63,7 @@ export const HrBookPlugin = async () => ({
     // Manual lookups have no place in a coding session, and an enabled tool
     // costs its description in context on every single request. Off by
     // default for the built-in agents, still overridable per user.
-    for (const name of ['build', 'plan']) {
-      const agent = (cfg.agent[name] = cfg.agent[name] ?? {});
-      agent.permission = {
-        ...Object.fromEntries(TOOL_NAMES.map((t) => [t, 'deny'])),
-        ...agent.permission,
-      };
-    }
+    // Note: build/plan agents now have access to hrbook tools for manual-referencing tasks.
   },
 
   tool: {
