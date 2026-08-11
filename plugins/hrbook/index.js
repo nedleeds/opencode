@@ -1,65 +1,26 @@
 import { readFile } from 'node:fs/promises';
-import { createInterface } from 'node:readline';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tool } from '../../tool.js';
-import { AUTOSYNC, listCached, loadBookinfos, rankBooks, readPage, searchWithAutoSync, checkBookUpdates, loadSyncManifest, checkoutBook, checkAllBooksUpdates, syncBook } from './lib.js';
+import { AUTOSYNC, listCached, loadBookinfos, rankBooks, readPage, searchWithAutoSync, checkoutBook, checkAllBooksUpdates, syncBook } from './lib.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const z = tool.schema;
 
 const TOOL_NAMES = ['hrbook_search', 'hrbook_read', 'hrbook_catalog', 'hrbook_checkout'];
 
-/**
- * The agent ships with the plugin instead of living in each user's
- * opencode.jsonc. Tools and the prompt that drives them are one unit — a
- * prompt that names `hrbook_read` is wrong the moment the tool is renamed —
- * and keeping them together is what reduces installation to one link.
- *
- * The prompt is read here rather than passed as `{file:...}`, because that
- * template resolves against the *user's* config directory, which this file
- * knows nothing about.
- */
 async function agentConfig() {
   return {
-    // No `name` field — the key under `cfg.agent` is the agent's name, and a
-    // second one here breaks every prompt sent to the agent. See the root
-    // README, "Adding a plugin".
     description:
-      'HD현대로보틱스 Hi6/Hi7 제어기 메뉴얼 Q&A. 조작·기능·Open API 등에 대한 질문에 사용.',
+      'HD 현대로보틱스 Hi6/Hi7 제어기 메뉴얼 Q&A. 조작·기능·Open API 등에 대한 질문에 사용.',
     mode: 'primary',
     prompt: await readFile(path.join(HERE, 'agent.md'), 'utf8'),
-    // `permission`, not `tools`. In opencode 1.18 an agent's tool list is
-    // derived from its permission ruleset (Permission.visibleTools), and the
-    // `tools` shorthand is folded into permissions while the config documents
-    // are parsed — before any plugin runs. A `tools` map set from here is
-    // therefore read by nobody and silently does nothing. `edit` is the
-    // permission behind write/edit/patch alike.
     permission: { edit: 'deny', bash: 'deny' },
   };
 }
 
 let autoSyncStarted = false;
 let syncInProgress = false;
-
-function askUser(question) {
-  return new Promise((resolve) => {
-    process.stderr.write('\n' + question + ' (y/n): ');
-    
-    const onData = (data) => {
-      const answer = data.toString().trim().toLowerCase();
-      process.stdin.removeListener('data', onData);
-      resolve(answer.startsWith('y'));
-    };
-    
-    process.stdin.once('data', onData);
-    
-    setTimeout(() => {
-      process.stdin.removeListener('data', onData);
-      resolve(false);
-    }, 30000);
-  });
-}
 
 async function handleInitialSync() {
   if (autoSyncStarted || syncInProgress) return;
@@ -113,10 +74,6 @@ async function handleInitialSync() {
   }
 }
 
-let autoSyncStarted = false;
-let syncInProgress = false;
-}
-
 export const HrBookPlugin = async () => ({
   async config(cfg) {
     cfg.agent = cfg.agent ?? {};
@@ -159,9 +116,6 @@ export const HrBookPlugin = async () => ({
         if (hits.length === 0) {
           const cached = await listCached();
           if (cached.length === 0) return 'No manuals cached. Run `hrbook-sync --defaults` first.';
-          // Spell out the boundary. Left to a bare "no match", models fill the
-          // gap from training data and invent page paths and viewer links —
-          // for controller manuals that is worse than saying nothing.
           const list = cached.map((c) => `${c.book}/${c.ver}`).join(', ');
           return [
             `No match for "${args.query}" in ${scanned} pages.`,
@@ -220,11 +174,6 @@ export const HrBookPlugin = async () => ({
       },
     }),
 
-    /**
-     * The full catalogue is ~5.4k tokens, so it is never put in the system
-     * prompt. It is reachable here, filtered, and only when the code-side
-     * matching in hrbook_search has already failed — a rare path.
-     */
     hrbook_catalog: tool({
       description:
         'Find which manual covers a topic when hrbook_search misses. Lists matching book_id/ver_id from the full catalogue, and marks what is cached.',
