@@ -1,8 +1,9 @@
 import { readFile } from 'node:fs/promises';
+import { createInterface } from 'node:readline';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tool } from '../../tool.js';
-import { AUTOSYNC, listCached, loadBookinfos, rankBooks, readPage, searchWithAutoSync, checkoutBook, checkAllBooksUpdates, syncBook } from './lib.js';
+import { AUTOSYNC, listCached, loadBookinfos, rankBooks, readPage, searchWithAutoSync, checkBookUpdates, loadSyncManifest, checkoutBook, checkAllBooksUpdates, syncBook } from './lib.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const z = tool.schema;
