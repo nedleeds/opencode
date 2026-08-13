@@ -138,7 +138,7 @@ export const HrBookPlugin = async ({ client }) => {
 
     state.building = true;
     await toast(
-      `매뉴얼 인덱스 내려받는 중 — ${PRIMARY_LANG} ${pending.length}권 (${CACHE})`,
+      `매뉴얼 내려받는 중 — ${PRIMARY_LANG} ${pending.length}권 (${CACHE})`,
       'loading',
     );
     try {
@@ -153,16 +153,16 @@ export const HrBookPlugin = async ({ client }) => {
         // not N independent problems, and the user has to change something
         // outside this conversation before anything works.
         state.lastError = brief(failed[0].error);
-        await toast(`매뉴얼 인덱스 내려받기 실패 — ${state.lastError}`, 'error');
+        await toast(`매뉴얼 내려받기 실패 — ${state.lastError}`, 'error');
         await remember(
-          `매뉴얼 인덱스를 하나도 내려받지 못했습니다 (${state.lastError}). ` +
+          `매뉴얼을 하나도 내려받지 못했습니다 (${state.lastError}). ` +
             `네트워크·프록시 또는 HRBOOK_RAW_BASE 설정을 확인하세요.`,
         );
       } else {
         await toast(
           failed.length
-            ? `매뉴얼 인덱스 ${ok.length}권 완료, ${failed.length}권 실패 — ${brief(failed[0].error)}`
-            : `매뉴얼 인덱스 ${ok.length}권 준비 완료`,
+            ? `매뉴얼 ${ok.length}권 완료, ${failed.length}권 실패 — ${brief(failed[0].error)}`
+            : `매뉴얼 ${ok.length}권 준비 완료`,
           failed.length ? 'info' : 'success',
         );
       }
@@ -191,7 +191,7 @@ export const HrBookPlugin = async ({ client }) => {
         const { ok, failed } = await fetchIndexSet(pending);
         state.counts.secondary = ok.length;
         if (ok.length > 0) {
-          await toast(`${SECONDARY_LANG} 매뉴얼 인덱스 ${ok.length}권 준비 완료`, 'success');
+          await toast(`${SECONDARY_LANG} 매뉴얼 ${ok.length}권 준비 완료`, 'success');
         }
         await log(`secondary index: ${ok.length} ok, ${failed.length} failed`);
       } catch (err) {
@@ -289,7 +289,7 @@ export const HrBookPlugin = async ({ client }) => {
     tool: {
       hrbook_search: tool({
         description:
-          'Full-text search across HD Hyundai Robotics Hi6/Hi7 controller manuals. Every manual is indexed locally, so this searches the actual text of all of them — not just titles. On the very first call it downloads the index set, which takes about 15 seconds; every call after that is instant.',
+          'Full-text search across HD Hyundai Robotics Hi6/Hi7 controller manuals. Every manual is held locally, so this searches the actual text of all of them — not just titles. The very first call downloads the manuals, which takes about 15 seconds; every call after that is instant.',
         args: {
           query: z.string().describe('Keywords only, e.g. "api_ver" or "조그 속도"'),
           product: z.enum(['hi6', 'hi7', 'hi5a', 'common', 'manipulator']).optional(),
@@ -298,18 +298,31 @@ export const HrBookPlugin = async ({ client }) => {
           limit: z.number().int().min(1).max(20).optional().describe('Default 8'),
         },
         async execute(args) {
+          let prepared = { built: false };
           try {
-            await ensurePrimary();
+            prepared = await ensurePrimary();
           } catch (err) {
             await log(`index preparation failed: ${err.message}`, 'warn');
             return (
-              `매뉴얼 인덱스를 준비하지 못했습니다 (${brief(err)}).\n` +
+              `매뉴얼을 준비하지 못했습니다 (${brief(err)}).\n` +
               `네트워크 문제입니다. 캐시가 비어서가 아니라 접근이 막힌 것이므로, ` +
               `사용자에게 이 사실을 알리고 추측으로 답하지 마세요.`
             );
           }
           startSecondary();
           void noticeLegacyClones();
+
+          // The toast that announced the download is gone by the time the
+          // answer appears, and the tool blocks until preparation finishes —
+          // so there is no moment at which the model could have said "fetching
+          // now". Saying it afterwards is the only option, and it matters:
+          // without it the first question just looks slow for no reason.
+          const notice = prepared.built
+            ? `[HRBook] 매뉴얼 ${prepared.ok}권을 새로 내려받았습니다 (${INDEX_DIR}).` +
+              (prepared.failed ? ` ${prepared.failed}권은 실패했습니다.` : '') +
+              ` 최초 1회만 걸리는 준비 과정이며, 다음 질문부터는 즉시 응답합니다.` +
+              ` 이 사실을 사용자에게 한 문장으로 전달하세요.\n\n`
+            : '';
 
           const base = { book: args.book_id, limit: args.limit };
           let lang = args.lang || PRIMARY_LANG;
@@ -335,7 +348,7 @@ export const HrBookPlugin = async ({ client }) => {
 
           if (result.hits.length === 0) {
             const indexes = await listIndexes();
-            return [
+            return notice + [
               `"${args.query}" 에 대한 결과가 없습니다 (${result.scanned}개 페이지 검색, 매뉴얼 ${indexes.length}권).`,
               '매뉴얼은 정상적으로 준비되어 있으며, 검색어와 일치하는 내용이 없는 것입니다.',
               // Spell out the boundary. Left to a bare "no match", models fill
@@ -347,6 +360,7 @@ export const HrBookPlugin = async ({ client }) => {
           }
 
           return (
+            notice +
             `${result.hits.length}/${result.total} match(es) in ${result.scanned} pages (lang=${lang}):\n` +
             formatHits(result.hits, result.total)
           );
@@ -355,7 +369,7 @@ export const HrBookPlugin = async ({ client }) => {
 
       hrbook_read: tool({
         description:
-          'Read one manual page as markdown. Served from the local index, so it is instant and needs no network. Use the exact book_id/ver_id/path returned by hrbook_search.',
+          'Read one manual page as markdown. Served from the local copy, so it is instant and needs no network. Use the exact book_id/ver_id/path returned by hrbook_search.',
         args: {
           book_id: z.string().describe('e.g. doc-hi6-open-api'),
           ver_id: z.string().describe('e.g. ko, en, ko-tp630'),
@@ -440,15 +454,15 @@ export const HrBookPlugin = async ({ client }) => {
 
       hrbook_refresh: tool({
         description:
-          '모든 매뉴얼 인덱스를 최신으로 다시 받는다. 매뉴얼이 개정되었는데 답변이 예전 내용일 때 사용.',
+          '모든 매뉴얼을 최신으로 다시 받는다. 매뉴얼이 개정되었는데 답변이 예전 내용일 때 사용.',
         args: {
           lang: z.string().optional().describe('Default: 준비된 모든 언어'),
         },
         async execute(args) {
           const targets = await listIndexes(args.lang);
-          if (targets.length === 0) return '준비된 매뉴얼 인덱스가 없습니다.';
+          if (targets.length === 0) return '준비된 매뉴얼이 없습니다.';
 
-          await toast(`매뉴얼 인덱스 ${targets.length}권 갱신 확인 중`, 'loading');
+          await toast(`매뉴얼 ${targets.length}권 갱신 확인 중`, 'loading');
           const results = await Promise.all(
             targets.map((t) => refreshIfChanged(t.book, t.ver)),
           );
@@ -474,7 +488,7 @@ export const HrBookPlugin = async ({ client }) => {
 
       hrbook_status: tool({
         description:
-          '매뉴얼 인덱스 준비 상태를 조회한다. 사용자가 진행 상황·실패 여부를 물을 때 사용.',
+          '매뉴얼 준비 상태를 조회한다. 사용자가 진행 상황·실패 여부를 물을 때 사용.',
         args: {},
         async execute() {
           const indexes = await listIndexes();
@@ -484,7 +498,7 @@ export const HrBookPlugin = async ({ client }) => {
             byLang.set(key, (byLang.get(key) ?? 0) + 1);
           }
           return [
-            state.building ? '인덱스 준비 중' : '인덱스 준비 완료',
+            state.building ? '매뉴얼 준비 중' : '매뉴얼 준비 완료',
             `준비된 매뉴얼: ${indexes.length}권` +
               (byLang.size
                 ? ` (${[...byLang].map(([k, v]) => `${k} ${v}`).join(', ')})`
@@ -492,7 +506,7 @@ export const HrBookPlugin = async ({ client }) => {
             state.counts.absent ? `book.md 미제공: ${state.counts.absent}권` : null,
             state.counts.failed ? `내려받기 실패: ${state.counts.failed}권` : null,
             state.lastError ? `마지막 오류: ${state.lastError}` : null,
-            `인덱스 위치: ${INDEX_DIR}`,
+            `저장 위치: ${INDEX_DIR}`,
             '갱신이 필요하면 hrbook_refresh 를 사용하세요.',
           ]
             .filter(Boolean)
