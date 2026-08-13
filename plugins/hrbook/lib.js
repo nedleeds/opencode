@@ -264,8 +264,12 @@ export function rawUrl(book, ver, relPath) {
 
 /** Deep link into the HRBook web viewer for a page. */
 export function viewerUrl(book, ver, relPath, contModel) {
-  const page = String(relPath).replace(/\\/g, '/').replace(/\.md$/i, '');
   const q = contModel ? `?cont_model=${encodeURIComponent(contModel)}` : '';
+  // A synthetic path means the manual's book.md recorded no page filenames, so
+  // there is no deep link to build — the front page is the honest answer, and
+  // an invented one would send the user to a 404.
+  if (String(relPath).startsWith('#')) return `${VIEWER_BASE}/#/view/${book}/${ver}${q}`;
+  const page = String(relPath).replace(/\\/g, '/').replace(/\.md$/i, '');
   return `${VIEWER_BASE}/#/view/${book}/${ver}/${page}${q}`;
 }
 
@@ -385,17 +389,18 @@ export async function listIndexes(lang) {
 }
 
 /**
- * Split one index into its original pages. The `__SOURCE` marker in front of
- * each page is what makes a hit in the concatenated text addressable: walking
- * back to the nearest marker yields the exact path `hrbook_read` needs, with
- * no table-of-contents lookup and no guessing from heading levels.
+ * Split one index into its original pages, using the `__SOURCE` marker that
+ * precedes each page in the concatenated file. Walking back to the nearest
+ * marker turns a hit into the exact path `hrbook_read` needs, with no
+ * table-of-contents lookup and no guessing from heading levels.
  */
 export function splitSections(text) {
+  const body = text.replace(/^\uFEFF/, '');
   const sections = [];
   let current = null;
   // The BOM sits in front of the very first marker. Left in place the opening
   // `[__SOURCE]` fails to match and the whole first page disappears.
-  for (const line of text.replace(/^\uFEFF/, '').split(/\r?\n/)) {
+  for (const line of body.split(/\r?\n/)) {
     const m = line.match(SOURCE_RE);
     if (m) {
       current = { path: m[1].trim(), heading: '', lines: [] };
@@ -406,6 +411,45 @@ export function splitSections(text) {
     if (!current.heading && /^#{1,6}\s+/.test(line)) {
       current.heading = line.replace(/^#{1,6}\s+/, '').trim();
     }
+    current.lines.push(line);
+  }
+
+  // Not every repository's book.md carries the markers — the generator version
+  // differs per manual. Without a fallback such a manual parses to zero
+  // sections and vanishes from search entirely while its file sits on disk
+  // looking perfectly healthy, which is exactly how the force-control manual
+  // came to "not contain" 민첩 모드.
+  if (sections.length === 0) return splitByHeadings(body);
+  return sections;
+}
+
+/**
+ * Headings as page boundaries, for manuals whose book.md has no `__SOURCE`
+ * markers. Paths are synthetic (`#3`) because the original page filenames are
+ * simply not recorded in the file; reads still work, since the text itself is
+ * right here, but a deep viewer link is not recoverable and falls back to the
+ * manual's front page.
+ */
+function splitByHeadings(text) {
+  const sections = [];
+  let current = null;
+  let n = 0;
+  const open = (heading, line) => {
+    current = { path: `#${++n}`, heading, lines: line === undefined ? [] : [line], synthetic: true };
+    sections.push(current);
+  };
+  for (const line of text.split(/\r?\n/)) {
+    if (/^#{1,3}\s+/.test(line)) {
+      open(
+        line
+          .replace(/^#{1,6}\s+/, '')
+          .replace(/[*_`]/g, '')
+          .trim(),
+        line,
+      );
+      continue;
+    }
+    if (!current) open('');
     current.lines.push(line);
   }
   return sections;
@@ -832,7 +876,10 @@ export async function readPage(book, ver, relPath, maxBytes = 12000, variables) 
     sections.find((s) => s.path.replace(/\.md$/i, '') === want.replace(/\.md$/i, ''));
   if (!section) throw new Error(`page not in index: ${book}/${ver}/${relPath}`);
 
-  let text = absolutiseLinks(section.lines.join('\n').trim(), book, ver, section.path);
+  // Relative image links can only be resolved against a real page directory.
+  let text = section.synthetic
+    ? section.lines.join('\n').trim()
+    : absolutiseLinks(section.lines.join('\n').trim(), book, ver, section.path);
   text = substitute(text, variables);
   const truncated = text.length > maxBytes;
   return {

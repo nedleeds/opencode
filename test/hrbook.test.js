@@ -556,3 +556,59 @@ test('rarity decides the weighting, so common words cannot outvote rare ones', a
     assert.equal(r.groups[0].pages[0].path, 'tune/gain.md');
   });
 });
+
+/**
+ * Not every repository's book.md carries `__SOURCE` markers — the generator
+ * version differs per manual. Without a fallback such a manual parses to zero
+ * sections and disappears from search while its file sits on disk looking
+ * perfectly healthy. That is precisely how the force-control manual came to
+ * "not contain" 민첩 모드 despite holding it on fourteen lines.
+ */
+const NO_MARKERS = [
+  '\uFEFF# 힘 제어 기능 설명서',
+  '개요입니다.',
+  '',
+  '## 제어 파라미터',
+  '응답 설정값이 낮을수록 민첩하게 도달합니다.',
+  '',
+  '### **[민첩 모드]**',
+  '민첩 모드는 추종 성능을 극대화합니다.',
+].join('\n');
+
+async function withUnmarked(fn) {
+  const cache = await mkdtemp(path.join(tmpdir(), 'hrbook-test-'));
+  try {
+    process.env.HRBOOK_CACHE = cache;
+    const lib = await import(`../plugins/hrbook/lib.js?nm=${encodeURIComponent(cache)}`);
+    await mkdir(lib.INDEX_DIR, { recursive: true });
+    await writeFile(lib.indexPath('doc-hi6-force-control', 'ko'), NO_MARKERS, 'utf8');
+    await fn(lib);
+  } finally {
+    delete process.env.HRBOOK_CACHE;
+    await rm(cache, { recursive: true, force: true });
+  }
+}
+
+test('a book.md without __SOURCE markers is split by heading instead of dropped', async () => {
+  await withUnmarked(async ({ splitSections, search }) => {
+    const sections = splitSections(NO_MARKERS);
+    assert.ok(sections.length >= 3, 'headings become section boundaries');
+    assert.ok(sections.every((s) => s.synthetic));
+    assert.equal(sections[0].heading, '힘 제어 기능 설명서');
+
+    const r = await search('민첩 모드', { lang: 'ko' });
+    assert.equal(r.groups[0].book, 'doc-hi6-force-control');
+    assert.equal(r.groups[0].tier, 'direct');
+  });
+});
+
+test('a synthetic section is still readable, and links to the manual front page', async () => {
+  await withUnmarked(async ({ search, readPage }) => {
+    const [hit] = (await search('민첩 모드', { lang: 'ko' })).groups[0].pages;
+    assert.match(hit.path, /^#\d+$/, 'the original filename is simply not recorded');
+    const { text, url } = await readPage('doc-hi6-force-control', 'ko', hit.path);
+    assert.match(text, /추종 성능/);
+    // No deep link is recoverable; inventing one would send the user to a 404.
+    assert.match(url, /\/view\/doc-hi6-force-control\/ko$/);
+  });
+});
