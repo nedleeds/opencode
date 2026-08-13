@@ -11,7 +11,7 @@
     ".": "./index.js"
   },
   "bin": {
-    "hrbook-sync": "plugins/hrbook/cli.js"
+    "hrbook": "plugins/hrbook/cli.js"
   },
   "files": [
     "index.js",

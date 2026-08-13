@@ -42,10 +42,13 @@ const load = (client = stubClient()) => plugin({ client }, {});
 
 test('registers every plugin tool under plugins/', async () => {
   const hooks = await load();
+  // `hrbook_checkout` is gone with the git layer — there are no branches to
+  // check out any more. `hrbook_refresh` takes its place as the one manual
+  // action a user can still need.
   assert.deepEqual(Object.keys(hooks.tool ?? {}).sort(), [
     'hrbook_catalog',
-    'hrbook_checkout',
     'hrbook_read',
+    'hrbook_refresh',
     'hrbook_search',
     'hrbook_status',
   ]);

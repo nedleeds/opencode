@@ -1,149 +1,128 @@
 #!/usr/bin/env node
-import { CACHE, listCached, loadBookinfos, refreshBookinfos, syncBook, syncAllBooks, writeManifest, checkBookUpdates, loadSyncManifest, saveSyncManifest, checkoutBook } from './lib.js';
+import {
+  CACHE,
+  INDEX_DIR,
+  PRIMARY_LANG,
+  SECONDARY_LANG,
+  booksForLang,
+  fetchIndexSet,
+  indexPath,
+  listIndexes,
+  loadBookinfos,
+  pendingFor,
+  rankBooks,
+  refreshBookinfos,
+  refreshIfChanged,
+} from './lib.js';
+import { stat } from 'node:fs/promises';
 
 /**
- * Sync is a separate CLI rather than a tool: it is slow, network-bound and run
- * rarely, so exposing it to the model would cost context on every request for
- * no benefit. One person can run this and share $HRBOOK_CACHE with the team.
+ * The plugin builds its index on the first question, so this exists for the
+ * cases a TUI cannot cover: priming a machine before anyone uses it, forcing a
+ * refresh, and seeing what is on disk without starting a session.
  */
-const DEFAULTS = [
-  ['doc-hi6-open-api', 'en'],
-  ['doc-hi6-open-api', 'ko'],
-  ['doc-hi6-operation', 'en-tp630'],
-  ['doc-hi6-operation', 'ko-tp630'],
-  ['doc-industrial-communication', 'en-Hi6'],
-  ['doc-industrial-communication', 'ko-Hi6'],
-];
+const args = process.argv.slice(2);
+const flag = (name) => args.includes(name);
+const value = (name, fallback) => {
+  const i = args.indexOf(name);
+  return i >= 0 && args[i + 1] ? args[i + 1] : fallback;
+};
 
 function usage() {
-  console.log(`hrbook-sync — populate the local HRBook manual cache
+  console.log(`hrbook — HD Hyundai Robotics manual index
 
-  hrbook-sync --refresh              only re-fetch bookinfos.json
-  hrbook-sync --defaults             refresh + sync a starter set of manuals
-  hrbook-sync --all                  sync ALL available manuals
-  hrbook-sync --check                check for updates to cached manuals
-  hrbook-sync --list [filter]        list manuals available to sync
-  hrbook-sync --status               show what is cached locally
-  hrbook-sync <book_id> <ver_id>...  sync specific manuals
+  hrbook --sync [--lang ko]     download the index set for a language
+  hrbook --sync-all             download every language in bookinfos
+  hrbook --refresh [--lang ko]  re-check indexes already on disk
+  hrbook --status               show what is on disk
+  hrbook --list [filter]        list manuals in the catalogue
 
-Cache: ${CACHE}
-Env:   HRBOOK_CACHE, HRBOOK_TARBALL_BASE, HRBOOK_BOOKINFOS_URL, HRBOOK_VIEWER_BASE
-       (set the *_BASE/_URL vars to an internal mirror on a closed network)`);
+Index location: ${INDEX_DIR}`);
 }
 
-async function syncPairs(pairs) {
-  let ok = 0;
-  const done = [];
-  for (const [book, ver] of pairs) {
-    process.stdout.write(`  ${book}/${ver} ... `);
-    try {
-      const n = await syncBook(book, ver, true);
-      console.log(`${n} pages`);
-      done.push({ book, ver, pages: n });
-      ok++;
-    } catch (err) {
-      console.log(`FAILED (${String(err.message).split('\n')[0].slice(0, 80)})`);
-    }
+const mb = (bytes) => (bytes / 1024 / 1024).toFixed(1);
+
+async function syncLang(lang) {
+  const entries = booksForLang(await loadBookinfos(), lang);
+  const pending = pendingFor(entries);
+  if (pending.length === 0) {
+    console.log(`${lang}: already complete (${entries.length} manual(s))`);
+    return;
   }
-  if (done.length) await writeManifest(done);
-  console.log(`\n${ok}/${pairs.length} synced into ${CACHE}`);
-  return ok === pairs.length ? 0 : 1;
+  console.log(`${lang}: downloading ${pending.length} of ${entries.length} manual(s)...`);
+  const { ok, absent, failed } = await fetchIndexSet(pending);
+  const bytes = ok.reduce((n, r) => n + (r.bytes ?? 0), 0);
+  console.log(`${lang}: ${ok.length} ok (${mb(bytes)} MB), ${absent.length} without book.md, ${failed.length} failed`);
+  for (const f of failed) console.log(`  FAILED ${f.book}/${f.ver}: ${f.error}`);
+  for (const a of absent) console.log(`  no book.md: ${a.book}/${a.ver}`);
 }
 
-const args = process.argv.slice(2);
-if (args.length === 0 || args[0] === '--help' || args[0] === '-h') {
+async function main() {
+  if (args.length === 0 || flag('--help') || flag('-h')) return usage();
+
+  if (flag('--status')) {
+    const indexes = await listIndexes(value('--lang', undefined));
+    let bytes = 0;
+    for (const i of indexes) {
+      try {
+        bytes += (await stat(indexPath(i.book, i.ver))).size;
+      } catch {
+        // A file removed between listing and stat is not worth failing over.
+      }
+    }
+    console.log(`${indexes.length} manual(s), ${mb(bytes)} MB`);
+    console.log(`cache: ${CACHE}`);
+    for (const i of indexes) console.log(`  ${i.book}/${i.ver}`);
+    return;
+  }
+
+  if (flag('--list')) {
+    const filter = args[args.indexOf('--list') + 1] ?? '';
+    const infos = await loadBookinfos();
+    const ranked = filter
+      ? rankBooks(filter, infos, { lang: value('--lang', undefined), limit: 50 })
+      : infos.filter((e) => !e.url);
+    for (const e of ranked) console.log(`  ${e.book_id}/${e.ver_id} — ${e.title}`);
+    console.log(`${ranked.length} manual(s)`);
+    return;
+  }
+
+  if (flag('--refresh')) {
+    const targets = await listIndexes(value('--lang', undefined));
+    if (targets.length === 0) return console.log('nothing on disk yet — run --sync first');
+    console.log(`checking ${targets.length} manual(s)...`);
+    const results = await Promise.all(targets.map((t) => refreshIfChanged(t.book, t.ver)));
+    const changed = results.filter((r) => r.changed);
+    const unchecked = results.filter((r) => !r.checked);
+    console.log(`${changed.length} updated, ${unchecked.length} could not be checked`);
+    for (const c of changed) console.log(`  updated ${c.book}/${c.ver}`);
+    return;
+  }
+
+  await refreshBookinfos();
+
+  if (flag('--sync-all')) {
+    const langs = new Set(
+      (await loadBookinfos())
+        .filter((e) => !e.url)
+        .map((e) => String(e.ver_id).split(/[-_]/)[0].toLowerCase()),
+    );
+    for (const lang of langs) await syncLang(lang);
+    return;
+  }
+
+  if (flag('--sync')) {
+    const lang = value('--lang', null);
+    if (lang) return syncLang(lang);
+    await syncLang(PRIMARY_LANG);
+    if (SECONDARY_LANG !== PRIMARY_LANG) await syncLang(SECONDARY_LANG);
+    return;
+  }
+
   usage();
-  process.exit(0);
 }
 
-try {
-  if (args[0] === '--status') {
-    const cached = await listCached();
-    if (!cached.length) console.log('nothing cached');
-    for (const { book, ver } of cached) console.log(`${book}/${ver}`);
-    process.exit(0);
-  }
-
-  if (args[0] === '--list') {
-    const filter = (args[1] || '').toLowerCase();
-    const seen = new Set();
-    for (const e of await loadBookinfos()) {
-      const key = `${e.book_id}/${e.ver_id}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      const line = `${key}  ${e.title}`;
-      if (!filter || line.toLowerCase().includes(filter)) console.log(line);
-    }
-    process.exit(0);
-  }
-
-  if (args[0] === '--refresh' || args[0] === '--defaults' || args[0] === '--all') {
-    console.log('bookinfos.json ...');
-    console.log(`  ${await refreshBookinfos()} entries`);
-    if (args[0] === '--refresh') process.exit(0);
-    
-    if (args[0] === '--all') {
-      const infos = await loadBookinfos();
-      const fetchable = infos.filter((e) => !e.url);
-      
-      const byBook = new Map();
-      for (const entry of fetchable) {
-        if (!byBook.has(entry.book_id)) {
-          byBook.set(entry.book_id, entry.ver_id);
-        }
-      }
-      
-      const manuals = [...byBook.entries()];
-      console.log(`\nSyncing ${manuals.length} manuals (first version of each)...`);
-      
-      let ok = 0;
-      let failed = 0;
-      
-      for (const [bookId, verId] of manuals) {
-        process.stdout.write(`  ${bookId}/${verId} ... `);
-        try {
-          const n = await syncBook(bookId, verId, true);
-          console.log(`${n} pages`);
-          ok++;
-        } catch (err) {
-          console.log(`FAILED`);
-          failed++;
-        }
-      }
-      
-      console.log(`\n${ok}/${manuals.length} synced`);
-      if (failed > 0) console.log(`${failed} failed`);
-      process.exit(failed > 0 ? 1 : 0);
-    }
-    
-    console.log('manuals:');
-    process.exit(await syncPairs(DEFAULTS));
-  }
-  
-  if (args[0] === '--check') {
-    console.log('Checking for updates...');
-    const updates = await checkBookUpdates();
-    if (updates.length === 0) {
-      console.log('All manuals are up to date.');
-      process.exit(0);
-    }
-    
-    console.log(`\n${updates.length} manual(s) have updates:`);
-    for (const update of updates) {
-      console.log(`  ${update.book}/${update.ver}: ${update.title}`);
-    }
-    console.log('\nRun `hrbook-sync --all` to update all manuals.');
-    process.exit(0);
-  }
-
-  if (args.length < 2 || args.length % 2 !== 0) {
-    console.error('expected pairs: hrbook-sync <book_id> <ver_id> [<book_id> <ver_id>...]');
-    process.exit(2);
-  }
-  const pairs = [];
-  for (let i = 0; i < args.length; i += 2) pairs.push([args[i], args[i + 1]]);
-  process.exit(await syncPairs(pairs));
-} catch (err) {
-  console.error(`error: ${err.message}`);
-  process.exit(1);
-}
+main().catch((err) => {
+  console.error(err.message);
+  process.exitCode = 1;
+});

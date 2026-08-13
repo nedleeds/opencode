@@ -1,40 +1,36 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tool } from '../../tool.js';
 import {
   CACHE,
-  isBookComplete,
-  listCached,
+  INDEX_DIR,
+  LEGACY_BOOKS_DIR,
+  PRIMARY_LANG,
+  SECONDARY_LANG,
+  booksForLang,
+  fetchIndexSet,
+  indexAbsent,
+  hasIndex,
+  legacyCloneSize,
+  listIndexes,
   loadBookinfos,
+  pendingFor,
   rankBooks,
   readPage,
   readRemotePage,
+  refreshIfChanged,
   remoteSearch,
   search,
-  checkoutBook,
-  syncBook,
 } from './lib.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const z = tool.schema;
 
-/**
- * Published for anything outside this process — a TUI sidebar, a statusline, a
- * dashboard. opencode's external TUI plugin layer does not load reliably, so
- * the renderer is deliberately not this plugin's problem.
- */
-const STATUS_FILE = path.join(CACHE, 'sync-status.json');
-
-/** How many manuals one question may pull in. Keeps a vague query from
- *  queueing the whole catalogue. */
-const MAX_ENQUEUE_PER_QUERY = 3;
-
-/** The line the model must relay so the user understands why an answer came
- *  over the network and what changes once the download lands. */
-const REMOTE_NOTICE =
-  '이 내용은 캐싱 전이라 원격 매뉴얼에서 직접 가져왔습니다. ' +
-  '캐싱이 완료되면 이후 답변은 로컬 캐시에서 즉시 제공됩니다.';
+/** How many manuals a single answer may re-check for updates. A question
+ *  normally hits one or two; the cap stops a broad query turning into a
+ *  round trip per manual in the catalogue. */
+const MAX_FRESHNESS_CHECKS = 3;
 
 async function agentConfig() {
   return {
@@ -54,42 +50,19 @@ async function agentConfig() {
   };
 }
 
-/**
- * Serialises every git invocation in this process.
- *
- * Two clones in the same `books/<book>/.git` collide on `index.lock` and the
- * caller stalls — which the model renders as an endless "Thinking". These are
- * network-bound clones against one host anyway, so serial costs nothing.
- */
-let gitLock = Promise.resolve();
-function withGitLock(fn) {
-  const run = gitLock.then(fn, fn);
-  gitLock = run.then(
-    () => {},
-    () => {},
-  );
-  return run;
-}
-
-/** Download state, shared between the worker and every tool so a tool can
- *  answer immediately instead of blocking on a clone. */
-const state = {
-  current: null,
-  queued: [],
-  done: [],
-  failed: [],
-};
-
 /** First line of an error, short enough to read in a toast. */
 const brief = (err) => String(err?.message ?? err).split('\n')[0].slice(0, 60);
+
+const mb = (bytes) => (bytes / 1024 / 1024).toFixed(1);
 
 export const HrBookPlugin = async ({ client }) => {
   /**
    * `client.tui.*` reaches the TUI over the server's HTTP API and throws when
    * no TUI is attached — `opencode run`, `serve`, `web`, `attach`, and briefly
-   * at startup. It does not latch off on the first failure, because downloads
-   * can begin before the TUI has connected; it gives up only after a long run
-   * of consecutive failures and resets as soon as one lands.
+   * at startup. It does not latch off on the first failure, because the
+   * background language set can finish before the TUI has connected; it gives
+   * up only after a long run of consecutive failures and resets as soon as one
+   * lands.
    *
    * The try/catch also covers `client` being absent entirely, which is how
    * tests and any host that calls the factory bare would otherwise take the
@@ -117,167 +90,186 @@ export const HrBookPlugin = async ({ client }) => {
     }
   };
 
-  async function publishStatus() {
+  /**
+   * Text the user has to act on later, put where it will still be there when
+   * they get to it. A toast is gone in seconds and the tool result scrolls
+   * away behind the answer; the prompt box survives both.
+   *
+   * Reserved for environment problems the user must fix by hand — never used
+   * for progress, which is what toasts are for.
+   */
+  const remember = async (text) => {
     try {
-      await mkdir(path.dirname(STATUS_FILE), { recursive: true });
-      await writeFile(
-        STATUS_FILE,
-        JSON.stringify({ ...state, updatedAt: new Date().toISOString() }, null, 2),
-        'utf8',
-      );
+      await client.tui.appendPrompt({ body: { text: `\n> [HRBook] ${text}\n` } });
+      return true;
     } catch {
-      // A missing status file must never break a download.
+      await log(`could not surface notice: ${text}`, 'warn');
+      return false;
+    }
+  };
+
+  const state = {
+    ready: false,
+    building: false,
+    secondaryStarted: false,
+    counts: { primary: 0, secondary: 0, absent: 0, failed: 0 },
+    lastError: null,
+  };
+
+  /**
+   * The primary language set, fetched synchronously on the first question.
+   *
+   * ~87 files and 7.7 MB, which measures at 16 s on the internal network. The
+   * user waits once; every question after that is a local grep at ~130 ms. The
+   * secondary language is deliberately *not* part of this wait — see below.
+   */
+  async function ensurePrimary() {
+    if (state.ready) return { built: false };
+    if (state.building) return { built: false, busy: true };
+
+    const infos = await loadBookinfos();
+    const entries = booksForLang(infos, PRIMARY_LANG);
+    const pending = pendingFor(entries);
+    if (pending.length === 0) {
+      state.ready = true;
+      state.counts.primary = entries.filter((e) => hasIndex(e.book, e.ver)).length;
+      return { built: false };
+    }
+
+    state.building = true;
+    await toast(
+      `매뉴얼 인덱스 내려받는 중 — ${PRIMARY_LANG} ${pending.length}권 (${CACHE})`,
+      'loading',
+    );
+    try {
+      const { ok, absent, failed } = await fetchIndexSet(pending);
+      state.counts.primary = entries.filter((e) => hasIndex(e.book, e.ver)).length;
+      state.counts.absent += absent.length;
+      state.counts.failed = failed.length;
+      state.ready = ok.length > 0 || state.counts.primary > 0;
+
+      if (failed.length > 0 && ok.length === 0) {
+        // A whole set failing is one shared cause — proxy, mirror, or DNS —
+        // not N independent problems, and the user has to change something
+        // outside this conversation before anything works.
+        state.lastError = brief(failed[0].error);
+        await toast(`매뉴얼 인덱스 내려받기 실패 — ${state.lastError}`, 'error');
+        await remember(
+          `매뉴얼 인덱스를 하나도 내려받지 못했습니다 (${state.lastError}). ` +
+            `네트워크·프록시 또는 HRBOOK_RAW_BASE 설정을 확인하세요.`,
+        );
+      } else {
+        await toast(
+          failed.length
+            ? `매뉴얼 인덱스 ${ok.length}권 완료, ${failed.length}권 실패 — ${brief(failed[0].error)}`
+            : `매뉴얼 인덱스 ${ok.length}권 준비 완료`,
+          failed.length ? 'info' : 'success',
+        );
+      }
+      await log(`primary index: ${ok.length} ok, ${absent.length} absent, ${failed.length} failed`);
+      return { built: true, ok: ok.length, failed: failed.length };
+    } finally {
+      state.building = false;
     }
   }
 
-  // ------------------------------------------------------------ download queue
-
-  const queue = [];
-  let workerRunning = false;
-
   /**
-   * Never awaited by a tool. The whole point is that a question returns
-   * immediately — from cache, or from the remote fallback — while the manuals
-   * it needs arrive in the background.
+   * The second language, fetched in the background after the first answer has
+   * already gone out. Doubling the opening wait to 33 s to prepare manuals the
+   * user has not asked for is a bad trade; running it while they read costs
+   * them nothing.
    */
-  function runWorker() {
-    if (workerRunning) return;
-    workerRunning = true;
+  function startSecondary() {
+    if (state.secondaryStarted || SECONDARY_LANG === PRIMARY_LANG) return;
+    state.secondaryStarted = true;
 
     void (async () => {
-      let batchDone = 0;
-      let batchFailed = 0;
       try {
-        while (queue.length > 0) {
-          const { book, ver } = queue.shift();
-          state.queued = queue.map((j) => j.book);
-          state.current = book;
-          await publishStatus();
-
-          const remaining = queue.length;
-          await toast(
-            remaining > 0
-              ? `매뉴얼 내려받는 중 — ${book} (대기 ${remaining}개)`
-              : `매뉴얼 내려받는 중 — ${book}`,
-            'info',
-          );
-
-          try {
-            const pages = await withGitLock(() => syncBook(book, ver, true));
-            batchDone++;
-            state.done.push(book);
-            await toast(`${book} 캐싱 완료 (${pages} 페이지)`, 'success');
-            await log(`cached ${book}/${ver} — ${pages} pages`);
-          } catch (err) {
-            batchFailed++;
-            state.failed.push(book);
-            // The reason belongs in the toast: a blocked host and a bad branch
-            // name need different fixes, and without it the user has to go
-            // digging in the logs to tell them apart.
-            await toast(`${book} 캐싱 실패 — ${brief(err)}`, 'error');
-            await log(`sync failed ${book}/${ver}: ${err.message}`, 'warn');
-          }
-
-          state.current = null;
-          await publishStatus();
+        const entries = booksForLang(await loadBookinfos(), SECONDARY_LANG);
+        const pending = pendingFor(entries);
+        if (pending.length === 0) return;
+        const { ok, failed } = await fetchIndexSet(pending);
+        state.counts.secondary = ok.length;
+        if (ok.length > 0) {
+          await toast(`${SECONDARY_LANG} 매뉴얼 인덱스 ${ok.length}권 준비 완료`, 'success');
         }
-      } finally {
-        workerRunning = false;
-        state.current = null;
-        state.queued = [];
-        await publishStatus();
-
-        // A whole batch failing is one shared cause — usually the network or a
-        // missing mirror — not N independent problems. Saying so once stops
-        // the user chasing each book separately.
-        if (batchFailed > 0 && batchDone === 0) {
-          await toast(
-            `매뉴얼 ${batchFailed}개 모두 실패. 네트워크 또는 미러 설정(HRBOOK_RAW_BASE, HRBOOK_TARBALL_BASE)을 확인하세요.`,
-            'error',
-          );
-        }
+        await log(`secondary index: ${ok.length} ok, ${failed.length} failed`);
+      } catch (err) {
+        await log(`secondary index failed: ${err.message}`, 'warn');
       }
     })();
   }
 
-  const isQueued = (book) => state.current === book || queue.some((j) => j.book === book);
-
-  /** Returns true if this call put the book on the queue. */
-  function enqueue(book, ver) {
-    if (isBookComplete(book)) return false;
-    if (isQueued(book)) return false;
-    // A book that already failed this session is not retried automatically;
-    // hammering a blocked host on every question helps nobody. `hrbook_status`
-    // reports it and `hrbook-sync <book> <ver>` retries it deliberately. The
-    // remote fallback keeps answering meanwhile.
-    if (state.failed.includes(book)) return false;
-    queue.push({ book, ver });
-    state.queued = queue.map((j) => j.book);
-    runWorker();
-    return true;
-  }
-
   /**
-   * Which manuals this question is about, restricted to ones not on disk.
+   * Check for updates only on the manuals this answer actually rests on.
    *
-   * A named `book_id` always counts. Otherwise a local miss takes the top
-   * candidates and a local hit takes only strong ones, so a question already
-   * answerable from cache does not drag in half the catalogue.
+   * Checking the whole set would be ~87 round trips per question. Searching
+   * the stale index first and then verifying the two or three manuals it hit
+   * costs one round trip each, and the shortcut is safe because a revision
+   * rarely changes *which* manual covers a topic.
    */
-  async function missingCandidates(query, opts, hadHits) {
-    const infos = await loadBookinfos();
-    const named = opts.book ? infos.filter((e) => e.book_id === opts.book) : [];
-    const ranked = rankBooks(query, infos, {
-      product: opts.product,
-      lang: opts.lang,
-      limit: MAX_ENQUEUE_PER_QUERY,
-    });
-    const pool = [...named, ...(hadHits ? ranked.filter((e) => e.score >= 4) : ranked)];
-
-    const out = [];
+  async function refreshHits(hits) {
     const seen = new Set();
-    for (const e of pool) {
-      if (seen.has(e.book_id)) continue;
-      seen.add(e.book_id);
-      if (isBookComplete(e.book_id)) continue;
-      out.push({ book: e.book_id, ver: e.ver_id });
-      if (out.length >= MAX_ENQUEUE_PER_QUERY) break;
+    const targets = [];
+    for (const h of hits) {
+      const key = `${h.book}@${h.ver}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      targets.push({ book: h.book, ver: h.ver });
+      if (targets.length >= MAX_FRESHNESS_CHECKS) break;
     }
-    return out;
+    if (targets.length === 0) return [];
+
+    const results = await Promise.all(targets.map((t) => refreshIfChanged(t.book, t.ver)));
+    const changed = results.filter((r) => r.changed);
+    if (changed.length > 0) {
+      await toast(
+        `${changed.map((c) => c.book).join(', ')} 매뉴얼이 갱신되어 최신 내용으로 답변합니다`,
+        'info',
+      );
+      await log(`refreshed: ${changed.map((c) => `${c.book}/${c.ver}`).join(', ')}`);
+    }
+    return changed;
   }
 
-  /** One line appended to a tool result so the model can describe the download
-   *  without inventing details. */
-  function pendingNote(justQueued) {
-    const parts = [];
-    if (justQueued.length > 0) {
-      parts.push(`캐싱 시작: ${justQueued.map((j) => j.book).join(', ')}`);
+  /** bookinfos entry for a (book, ver), for GitBook variable substitution. */
+  async function variablesFor(book, ver) {
+    try {
+      const infos = await loadBookinfos();
+      return infos.find((e) => e.book_id === book && e.ver_id === ver)?.variables;
+    } catch {
+      return undefined;
     }
-    if (state.current) parts.push(`현재 캐싱 중: ${state.current}`);
-    if (queue.length > 0) parts.push(`대기 ${queue.length}개`);
-    if (parts.length === 0) return '';
-    return `\n\n[HRBook] ${parts.join(' / ')}\n${REMOTE_NOTICE}\n기다리지 말고 지금 답하세요.`;
   }
 
-  /**
-   * Search the remote table of contents for candidate books. One HTTP round
-   * trip per book — the TOC lists every page with its title, which is enough
-   * to hand the model exact paths to read.
-   */
-  async function remoteLookup(query, candidates, limitPerBook = 3) {
-    const out = [];
-    for (const c of candidates) {
-      try {
-        const hits = await remoteSearch(query, c.book, c.ver, limitPerBook);
-        for (const h of hits) out.push({ ...h, book: c.book, ver: c.ver });
-      } catch (err) {
-        await log(`remote lookup failed ${c.book}/${c.ver}: ${err.message}`, 'warn');
-      }
+  const formatHits = (hits, total) =>
+    hits
+      .map(
+        (h) =>
+          `- book_id=${h.book} ver_id=${h.ver} path=${h.path}\n  ${h.heading || '(제목 없음)'}\n  ${h.snippet}`,
+      )
+      .join('\n') + (total > hits.length ? `\n(${total - hits.length} more)` : '');
+
+  const legacyNoticeShown = { done: false };
+  async function noticeLegacyClones() {
+    if (legacyNoticeShown.done) return;
+    legacyNoticeShown.done = true;
+    try {
+      const bytes = await legacyCloneSize();
+      if (bytes < 100 * 1024 * 1024) return;
+      // Never deleted automatically. It is the user's disk, the directory is
+      // large enough that removing it by surprise would be alarming, and the
+      // command has to be run outside this conversation anyway.
+      await remember(
+        `이전 버전이 남긴 clone 캐시가 ${mb(bytes)} MB 있습니다. 더 이상 쓰지 않으니 지워도 됩니다: ` +
+          `Remove-Item -Recurse -Force "${LEGACY_BOOKS_DIR}"`,
+      );
+    } catch {
+      // Reporting disk usage must never break a question.
     }
-    return out;
   }
 
-  await log(`hrbook loaded — cache: ${CACHE}`);
+  await log(`hrbook loaded — index: ${INDEX_DIR}`);
 
   return {
     async config(cfg) {
@@ -297,7 +289,7 @@ export const HrBookPlugin = async ({ client }) => {
     tool: {
       hrbook_search: tool({
         description:
-          'Search HD Hyundai Robotics Hi6/Hi7 controller manuals. Searches the local cache first; if a relevant manual is not cached it starts downloading in the background AND searches it remotely so the question can still be answered now. Never waits for a download.',
+          'Full-text search across HD Hyundai Robotics Hi6/Hi7 controller manuals. Every manual is indexed locally, so this searches the actual text of all of them — not just titles. On the very first call it downloads the index set, which takes about 15 seconds; every call after that is instant.',
         args: {
           query: z.string().describe('Keywords only, e.g. "api_ver" or "조그 속도"'),
           product: z.enum(['hi6', 'hi7', 'hi5a', 'common', 'manipulator']).optional(),
@@ -306,143 +298,117 @@ export const HrBookPlugin = async ({ client }) => {
           limit: z.number().int().min(1).max(20).optional().describe('Default 8'),
         },
         async execute(args) {
-          const opts = {
-            product: args.product,
-            lang: args.lang,
-            book: args.book_id,
-            limit: args.limit,
-          };
-
-          // Local first. Always returns in milliseconds.
-          const { hits, scanned, total } = await search(args.query, opts);
-
-          // Queue whatever is missing, then look it up remotely so the answer
-          // does not have to wait for the clone.
-          let candidates = [];
-          const justQueued = [];
           try {
-            candidates = await missingCandidates(args.query, opts, hits.length > 0);
-            for (const c of candidates) {
-              if (enqueue(c.book, c.ver)) justQueued.push(c);
-            }
+            await ensurePrimary();
           } catch (err) {
-            await log(`candidate lookup failed: ${err.message}`, 'warn');
-          }
-
-          const local = hits.length
-            ? `${hits.length}/${total} match(es) in ${scanned} cached pages:\n` +
-              hits
-                .map(
-                  (h) =>
-                    `- book_id=${h.book} ver_id=${h.ver} path=${h.path}\n  ${h.heading || h.title}\n  ${h.snippet}\n  ${h.url}`,
-                )
-                .join('\n') +
-              (total > hits.length ? `\n(${total - hits.length} more)` : '')
-            : `No match for "${args.query}" in ${scanned} cached pages.`;
-
-          const remote = candidates.length ? await remoteLookup(args.query, candidates) : [];
-          const remoteBlock = remote.length
-            ? '\n\n아직 캐싱되지 않은 매뉴얼에서 찾은 결과 (원격, hrbook_read 로 바로 읽을 수 있음):\n' +
-              remote
-                .map((r) => `- book_id=${r.book} ver_id=${r.ver} path=${r.path}\n  ${r.title}`)
-                .join('\n')
-            : '';
-
-          if (!hits.length && !remote.length) {
-            const cached = await listCached();
+            await log(`index preparation failed: ${err.message}`, 'warn');
             return (
-              [
-                local,
-                cached.length
-                  ? `Cached manuals: ${cached.map((c) => `${c.book}/${c.ver}`).join(', ')}.`
-                  : '캐시된 매뉴얼이 아직 없습니다.',
-                // Spell out the boundary. Left to a bare "no match", models
-                // fill the gap from training data and invent page paths and
-                // viewer links — for controller manuals that is worse than
-                // saying nothing.
-                'Retry ONCE with fewer keywords, then use hrbook_catalog to find the right manual.',
-                'Do NOT answer from memory and do NOT invent page paths or viewer links.',
-              ].join('\n') + pendingNote(justQueued)
+              `매뉴얼 인덱스를 준비하지 못했습니다 (${brief(err)}).\n` +
+              `네트워크 문제입니다. 캐시가 비어서가 아니라 접근이 막힌 것이므로, ` +
+              `사용자에게 이 사실을 알리고 추측으로 답하지 마세요.`
             );
           }
+          startSecondary();
+          void noticeLegacyClones();
 
-          return local + remoteBlock + pendingNote(justQueued);
+          const base = { book: args.book_id, limit: args.limit };
+          let lang = args.lang || PRIMARY_LANG;
+          let result = await search(args.query, { ...base, lang });
+
+          // Fall through to the other language rather than reporting nothing:
+          // some manuals are only meaningful in English, and the user should
+          // not have to know which.
+          if (result.hits.length === 0 && !args.lang && SECONDARY_LANG !== PRIMARY_LANG) {
+            const alt = await search(args.query, { ...base, lang: SECONDARY_LANG });
+            if (alt.hits.length > 0) {
+              lang = SECONDARY_LANG;
+              result = alt;
+            }
+          }
+
+          if (result.hits.length > 0) {
+            const changed = await refreshHits(result.hits);
+            if (changed.length > 0) {
+              result = await search(args.query, { ...base, lang });
+            }
+          }
+
+          if (result.hits.length === 0) {
+            const indexes = await listIndexes();
+            return [
+              `"${args.query}" 에 대한 결과가 없습니다 (${result.scanned}개 페이지 검색, 매뉴얼 ${indexes.length}권).`,
+              '매뉴얼은 정상적으로 준비되어 있으며, 검색어와 일치하는 내용이 없는 것입니다.',
+              // Spell out the boundary. Left to a bare "no match", models fill
+              // the gap from training data and invent page paths and viewer
+              // links — for controller manuals that is worse than silence.
+              'Retry ONCE with fewer keywords, then use hrbook_catalog to find the right manual.',
+              'Do NOT answer from memory and do NOT invent page paths or viewer links.',
+            ].join('\n');
+          }
+
+          return (
+            `${result.hits.length}/${result.total} match(es) in ${result.scanned} pages (lang=${lang}):\n` +
+            formatHits(result.hits, result.total)
+          );
         },
       }),
 
       hrbook_read: tool({
         description:
-          'Read one manual page as markdown. Reads from the local cache when the manual is cached, and fetches the page over the network when it is not — either way it returns the content, so never skip a page just because it is uncached.',
+          'Read one manual page as markdown. Served from the local index, so it is instant and needs no network. Use the exact book_id/ver_id/path returned by hrbook_search.',
         args: {
           book_id: z.string().describe('e.g. doc-hi6-open-api'),
-          ver_id: z.string().describe('e.g. en, ko, en-tp630'),
+          ver_id: z.string().describe('e.g. ko, en, ko-tp630'),
           path: z.string().describe('e.g. 1-version/1-get/1-api_ver.md'),
           maxBytes: z.number().int().min(500).max(40000).optional().describe('Default 12000'),
         },
         async execute(args) {
-          const cached = isBookComplete(args.book_id);
+          const variables = await variablesFor(args.book_id, args.ver_id);
 
-          if (!cached) {
-            enqueue(args.book_id, args.ver_id);
+          if (hasIndex(args.book_id, args.ver_id)) {
             try {
-              const { text, truncated, url } = await readRemotePage(
+              const { text, truncated, url } = await readPage(
                 args.book_id,
                 args.ver_id,
                 args.path,
                 args.maxBytes,
+                variables,
               );
-              return (
-                `${url}\n\n${text}${truncated ? '\n\n[truncated — raise maxBytes for more]' : ''}` +
-                `\n\n[HRBook] ${REMOTE_NOTICE}\n이 안내를 사용자에게 한 문장으로 전달하세요.`
-              );
+              return `${url}\n\n${text}${truncated ? '\n\n[truncated — raise maxBytes for more]' : ''}`;
             } catch (err) {
-              await log(`remote read failed ${args.book_id}/${args.ver_id}: ${err.message}`, 'warn');
-              return (
-                `${args.book_id}/${args.ver_id}/${args.path} 를 원격에서도 가져오지 못했습니다 (${brief(err)}).\n` +
-                `백그라운드 캐싱은 계속 진행 중입니다. 이미 캐시된 매뉴얼로 답하거나, 사용자에게 잠시 후 다시 질문해 달라고 안내하세요.`
-              );
+              await log(`index read failed ${args.book_id}/${args.ver_id}: ${err.message}`, 'warn');
             }
           }
 
-          await withGitLock(() => checkoutBook(args.book_id, args.ver_id));
-          const { text, truncated, url } = await readPage(
-            args.book_id,
-            args.ver_id,
-            args.path,
-            args.maxBytes,
-          );
-          return `${url}\n\n${text}${truncated ? '\n\n[truncated — raise maxBytes for more]' : ''}`;
-        },
-      }),
-
-      hrbook_checkout: tool({
-        description:
-          'Checkout a specific branch (language/version) of a cached manual. Use when you need to switch to a different language.',
-        args: {
-          book_id: z.string().describe('e.g. doc-hi6-open-api'),
-          ver_id: z.string().describe('e.g. en, ko, en-tp630'),
-        },
-        async execute(args) {
-          if (!isBookComplete(args.book_id)) {
-            const queued = enqueue(args.book_id, args.ver_id);
+          // A handful of manuals publish no book.md, and a path can also come
+          // from the model rather than from a search hit. Either way the page
+          // itself is still fetchable on its own.
+          try {
+            const { text, truncated, url } = await readRemotePage(
+              args.book_id,
+              args.ver_id,
+              args.path,
+              args.maxBytes,
+              variables,
+            );
+            return `${url}\n\n${text}${truncated ? '\n\n[truncated — raise maxBytes for more]' : ''}`;
+          } catch (err) {
             return (
-              `${args.book_id} 는 아직 캐싱되지 않았습니다.${queued ? ' 백그라운드 캐싱을 시작했습니다.' : ''}\n` +
-              `그동안 hrbook_read 로 해당 ver_id 페이지를 원격에서 바로 읽을 수 있습니다.`
+              `${args.book_id}/${args.ver_id}/${args.path} 를 읽지 못했습니다 (${brief(err)}).\n` +
+              `경로를 추측하지 말고, hrbook_search 결과에 있는 path 를 그대로 사용하세요.`
             );
           }
-          await withGitLock(() => checkoutBook(args.book_id, args.ver_id));
-          return `Checked out ${args.book_id} to branch ${args.ver_id}`;
         },
       }),
 
       /**
        * The full catalogue is ~5.4k tokens, so it is never put in the system
-       * prompt. It is reachable here, filtered, and only when the code-side
-       * matching in hrbook_search has already failed — a rare path.
+       * prompt. It is reachable here, filtered, and only when full-text search
+       * has already failed — a rare path now that search reads every manual.
        */
       hrbook_catalog: tool({
         description:
-          'Find which manual covers a topic when hrbook_search misses. Lists matching book_id/ver_id from the full catalogue, and marks what is cached or downloading.',
+          'Browse the manual catalogue by keyword when hrbook_search finds nothing. Lists matching book_id/ver_id and titles.',
         args: {
           filter: z
             .string()
@@ -460,34 +426,74 @@ export const HrBookPlugin = async ({ client }) => {
           if (ranked.length === 0) return `No manual matches "${args.filter}".`;
           const rows = ranked
             .map((e) => {
-              const mark = isBookComplete(e.book_id)
-                ? ' [cached]'
-                : isQueued(e.book_id)
-                  ? ' [caching]'
-                  : '';
+              const mark = hasIndex(e.book_id, e.ver_id)
+                ? ''
+                : indexAbsent(e.book_id, e.ver_id)
+                  ? ' [book.md 없음 — 페이지 단위 조회만 가능]'
+                  : ' [미준비]';
               return `- book_id=${e.book_id} ver_id=${e.ver_id}${mark} — ${e.title}`;
             })
             .join('\n');
-          return `${ranked.length} manual(s) matching "${args.filter}":\n${rows}\n\nUncached ones can still be read with hrbook_read; caching starts automatically on the next hrbook_search.`;
+          return `${ranked.length} manual(s) matching "${args.filter}":\n${rows}`;
+        },
+      }),
+
+      hrbook_refresh: tool({
+        description:
+          '모든 매뉴얼 인덱스를 최신으로 다시 받는다. 매뉴얼이 개정되었는데 답변이 예전 내용일 때 사용.',
+        args: {
+          lang: z.string().optional().describe('Default: 준비된 모든 언어'),
+        },
+        async execute(args) {
+          const targets = await listIndexes(args.lang);
+          if (targets.length === 0) return '준비된 매뉴얼 인덱스가 없습니다.';
+
+          await toast(`매뉴얼 인덱스 ${targets.length}권 갱신 확인 중`, 'loading');
+          const results = await Promise.all(
+            targets.map((t) => refreshIfChanged(t.book, t.ver)),
+          );
+          const changed = results.filter((r) => r.changed);
+          const unchecked = results.filter((r) => !r.checked);
+
+          await toast(
+            changed.length
+              ? `매뉴얼 ${changed.length}권 갱신됨`
+              : '모든 매뉴얼이 이미 최신입니다',
+            'success',
+          );
+
+          return [
+            `확인 ${targets.length}권 / 갱신 ${changed.length}권` +
+              (unchecked.length ? ` / 확인 실패 ${unchecked.length}권` : ''),
+            changed.length ? `갱신: ${changed.map((c) => c.book).join(', ')}` : null,
+          ]
+            .filter(Boolean)
+            .join('\n');
         },
       }),
 
       hrbook_status: tool({
         description:
-          '매뉴얼 캐싱 상태를 조회한다. 사용자가 진행 상황·남은 개수·실패 여부를 물을 때 사용.',
+          '매뉴얼 인덱스 준비 상태를 조회한다. 사용자가 진행 상황·실패 여부를 물을 때 사용.',
         args: {},
         async execute() {
-          const cached = await listCached();
+          const indexes = await listIndexes();
+          const byLang = new Map();
+          for (const i of indexes) {
+            const key = i.ver.split(/[-_]/)[0];
+            byLang.set(key, (byLang.get(key) ?? 0) + 1);
+          }
           return [
-            state.current ? `캐싱 중: ${state.current}` : '캐싱 중인 매뉴얼 없음',
-            queue.length ? `대기: ${queue.map((j) => j.book).join(', ')}` : null,
-            state.done.length ? `이번 세션 완료: ${state.done.join(', ')}` : null,
-            state.failed.length
-              ? `실패: ${state.failed.join(', ')} (재시도: hrbook-sync <book_id> <ver_id>)`
-              : null,
-            `캐시된 매뉴얼: ${cached.length}개`,
-            `캐시 위치: ${CACHE}`,
-            '캐싱되지 않은 매뉴얼도 hrbook_read 로 원격에서 읽을 수 있습니다.',
+            state.building ? '인덱스 준비 중' : '인덱스 준비 완료',
+            `준비된 매뉴얼: ${indexes.length}권` +
+              (byLang.size
+                ? ` (${[...byLang].map(([k, v]) => `${k} ${v}`).join(', ')})`
+                : ''),
+            state.counts.absent ? `book.md 미제공: ${state.counts.absent}권` : null,
+            state.counts.failed ? `내려받기 실패: ${state.counts.failed}권` : null,
+            state.lastError ? `마지막 오류: ${state.lastError}` : null,
+            `인덱스 위치: ${INDEX_DIR}`,
+            '갱신이 필요하면 hrbook_refresh 를 사용하세요.',
           ]
             .filter(Boolean)
             .join('\n');

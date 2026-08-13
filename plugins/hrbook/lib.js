@@ -8,18 +8,24 @@ import { promisify } from 'node:util';
 const run = promisify(execFile);
 
 /**
- * Everything the agent does at query time reads from a local cache. Nothing
- * touches the network except `sync`, which is an explicit, human-triggered
- * step. That is what keeps answers instant on a corporate network where
- * github.com may be slow, proxied, or blocked outright — and it means a single
- * person can sync once and share the cache directory with the whole team.
+ * Every manual repository publishes `book.md`: the whole manual concatenated
+ * into one file, ~480 KB, with a `[__SOURCE](relative/path.md)` marker in
+ * front of each original page. One HTTP GET per manual therefore buys the
+ * complete text *and* the page boundaries.
+ *
+ * That single fact removes the entire clone-based design this plugin used to
+ * carry. A full Korean set is 87 files and 7.7 MB — 16 s to fetch, 133 ms to
+ * grep — against gigabytes and tens of minutes for `git clone`. It also
+ * removes the need to guess which manual a question is about: with every
+ * manual on disk, relevance is decided by what the text actually matches
+ * rather than by keyword-scoring the catalogue and hoping.
  */
+
 /**
- * On Windows the cache goes on D: rather than C:. These repos carry their full
- * git history and grow into the gigabytes, and C: is where the corporate image
- * is tightest. `HRBOOK_CACHE` still wins, `HRBOOK_CACHE_DRIVE` picks a
- * different drive, and a machine without that drive falls back to the home
- * directory — so a laptop keeps working with no configuration.
+ * On Windows the cache goes on D: rather than C:. `HRBOOK_CACHE` still wins,
+ * `HRBOOK_CACHE_DRIVE` picks a different drive, and a machine without that
+ * drive falls back to the home directory — so a laptop keeps working with no
+ * configuration.
  */
 function defaultCache() {
   if (process.env.HRBOOK_CACHE) return process.env.HRBOOK_CACHE;
@@ -34,28 +40,63 @@ function defaultCache() {
 }
 
 export const CACHE = defaultCache();
-export const BOOKS_DIR = path.join(CACHE, 'books');
+export const INDEX_DIR = path.join(CACHE, 'index');
 export const BOOKINFOS = path.join(CACHE, 'bookinfos.json');
-export const SYNC_MANIFEST = path.join(CACHE, 'sync-manifest.json');
 
-/** Overridable so an internal mirror can be used instead of github.com. */
-const TARBALL_BASE =
-  process.env.HRBOOK_TARBALL_BASE || 'https://codeload.github.com/hyundai-robotics';
+/** Left over from the clone era. Never written to now — only reported, so a
+ *  user can reclaim the gigabytes deliberately rather than by surprise. */
+export const LEGACY_BOOKS_DIR = path.join(CACHE, 'books');
+
+const RAW_BASE =
+  process.env.HRBOOK_RAW_BASE || 'https://raw.githubusercontent.com/hyundai-robotics';
 const BOOKINFOS_URL =
   process.env.HRBOOK_BOOKINFOS_URL ||
   'https://raw.githubusercontent.com/hyundai-robotics/hrbookinfos/master/bookinfos.json';
 const VIEWER_BASE = process.env.HRBOOK_VIEWER_BASE || 'https://hrbook-hrc.web.app';
 
+/** Language set fetched first, synchronously. The other one follows in the
+ *  background so the first question waits for one set, not two. */
+export const PRIMARY_LANG = process.env.HRBOOK_LANG || 'ko';
+export const SECONDARY_LANG = process.env.HRBOOK_LANG_2 || 'en';
+
+export const CONCURRENCY = Number(process.env.HRBOOK_CONCURRENCY || 8);
+
+// ------------------------------------------------------------------ transport
+
 /**
- * `curl` rather than fetch(): Node's fetch ignores HTTP_PROXY/HTTPS_PROXY, and
- * a proxy is the normal case on an internal network. curl honours those plus
+ * curl rather than fetch(): Node's fetch ignores HTTP_PROXY/HTTPS_PROXY, and a
+ * proxy is the normal case on an internal network. curl honours those plus
  * .curlrc and the system CA store, so it works where fetch silently hangs.
+ * `--ssl-no-revoke` is required on Windows, where the corporate firewall
+ * blocks the certificate revocation check and curl otherwise fails closed.
  */
+const REVOKE = process.platform === 'win32' ? ['--ssl-no-revoke'] : [];
+
 async function download(url, dest) {
   await mkdir(path.dirname(dest), { recursive: true });
-  const REVOKE = process.platform === 'win32' ? ['--ssl-no-revoke'] : [];
+  const tmp = `${dest}.tmp`;
+  try {
+    await run('curl', ['-sSL', '--fail', ...REVOKE, '--max-time', '180', '-o', tmp, url]);
+    // Rename last: a half-written index is worse than a missing one, because
+    // nothing downstream can tell it is truncated.
+    await rename(tmp, dest);
+  } finally {
+    await rm(tmp, { force: true });
+  }
+}
 
-  await run('curl', ['-sSL', '--fail', ...REVOKE, '--max-time', '180', '-o', dest, url]);
+/**
+ * HEAD, for the freshness check. `content-length` is the whole state: it is
+ * compared against the size already on disk, so nothing has to be recorded
+ * between runs. An edit that happens to preserve the byte count is missed —
+ * acceptable, since such an edit is by definition tiny, and the next real
+ * revision catches it.
+ */
+export async function headInfo(url) {
+  const { stdout } = await run('curl', ['-sI', ...REVOKE, '--max-time', '30', url]);
+  const status = Number(stdout.match(/^HTTP\/[\d.]+\s+(\d+)/m)?.[1] ?? 0);
+  const bytes = Number(stdout.match(/^content-length:\s*(\d+)/im)?.[1] ?? 0);
+  return { status, bytes };
 }
 
 /**
@@ -64,7 +105,7 @@ async function download(url, dest) {
  * rejects the whole call with `JSON Parse error: Unrecognized token`.
  */
 async function readText(file) {
-  return (await readFile(file, 'utf8')).replace(/^﻿/, '');
+  return (await readFile(file, 'utf8')).replace(/^\uFEFF/, '');
 }
 
 export async function loadBookinfos() {
@@ -78,105 +119,20 @@ export async function loadBookinfos() {
   return JSON.parse(await readText(BOOKINFOS));
 }
 
-/** Deep link into the HRBook web viewer for a cached page. */
-export function viewerUrl(book, ver, relPath, contModel) {
-  const page = relPath.replace(/\\/g, '/').replace(/\.md$/i, '');
-  const q = contModel ? `?cont_model=${encodeURIComponent(contModel)}` : '';
-  return `${VIEWER_BASE}/#/view/${book}/${ver}/${page}${q}`;
+export async function refreshBookinfos() {
+  await download(BOOKINFOS_URL, BOOKINFOS);
+  return (await loadBookinfos()).length;
 }
 
-/** GitBook templating: `${cont_model}` etc. come from the bookinfos entry. */
-export function substitute(text, variables) {
-  if (!variables) return text;
-  return text.replace(/\$\{(\w+)\}/g, (m, key) =>
-    Object.hasOwn(variables, key) ? String(variables[key]) : m,
-  );
-}
+// ------------------------------------------------------------------ catalogue
 
-export async function listCached() {
-  if (!existsSync(BOOKS_DIR)) return [];
-  const out = [];
-  for (const book of await readdir(BOOKS_DIR)) {
-    const bookDir = path.join(BOOKS_DIR, book);
-    if (!(await stat(bookDir)).isDirectory()) continue;
-    
-    const gitDir = path.join(bookDir, '.git');
-    if (existsSync(gitDir)) {
-      try {
-        const { stdout: branch } = await run('git', ['-C', bookDir, 'branch', '--show-current']);
-        const currentBranch = branch.trim();
-        if (currentBranch) out.push({ book, ver: currentBranch, git: true });
-      } catch {
-        // Not a git repo or error
-      }
-    } else {
-      for (const ver of await readdir(bookDir)) {
-        if ((await stat(path.join(bookDir, ver))).isDirectory()) {
-          out.push({ book, ver, git: false });
-        }
-      }
-    }
-  }
-  return out;
-}
-
-async function walkMarkdown(dir, base = dir, acc = []) {
-  if (!existsSync(dir)) return acc;
-  for (const entry of await readdir(dir, { withFileTypes: true })) {
-    if (entry.name.startsWith('.')) continue;
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) await walkMarkdown(full, base, acc);
-    else if (entry.name.toLowerCase().endsWith('.md')) acc.push(path.relative(base, full));
-  }
-  return acc;
-}
+/** Entries served as an external PDF have no repository to fetch. */
+const fetchable = (e) => !e.url;
 
 /**
- * `book.md` is the entire manual concatenated into one file (up to ~470 KB, or
- * >100k tokens). Every line in it is duplicated from a real page, so indexing
- * it only produces noisy hits that point at a file no agent should ever read.
- */
-const SKIP_FILES = new Set(['book.md']);
-
-/** Nearest markdown heading above `line`, used to label a hit. */
-function headingFor(lines, line) {
-  for (let i = line; i >= 0; i--) {
-    const m = /^#{1,6}\s+(.*)$/.exec(lines[i]);
-    if (m) return m[1].trim();
-  }
-  return '';
-}
-
-/**
- * Pick the line covering the most query terms rather than the first line
- * touching any of them — with a multi-word query the first loose match is
- * usually the least informative one on the page.
- */
-function bestLine(lines, terms) {
-  let best = -1;
-  let bestScore = 0;
-  for (let i = 0; i < lines.length; i++) {
-    const l = lines[i].toLowerCase();
-    if (!l.trim()) continue;
-    const n = terms.filter((t) => l.includes(t)).length;
-    if (n > bestScore) {
-      bestScore = n;
-      best = i;
-    }
-    if (n === terms.length) break;
-  }
-  return { line: best < 0 ? 0 : best, matched: bestScore };
-}
-
-function meta(infos, book, ver) {
-  return infos.find((e) => e.book_id === book && e.ver_id === ver);
-}
-
-/**
- * ver_id encodes language in two styles — `ko` / `en` / `zh` on newer manuals
- * and `korean` / `english` / `chinese` / `german` on older ones. Matching on a
- * bare prefix works by luck for ko and en but silently drops every `chinese*`
- * manual for `zh`, and leaves German unreachable entirely.
+ * ver_id uses two naming styles that coexist in bookinfos.json — `ko`/`zh`
+ * alongside `korean`/`chinese` — and both may carry a controller or teach
+ * pendant suffix (`ko-Hi6`, `ko-tp630`).
  */
 const LANG_ALIASES = {
   ko: ['ko', 'korean'],
@@ -185,41 +141,51 @@ const LANG_ALIASES = {
   de: ['de', 'german'],
 };
 
-function matchesLang(ver, lang) {
+/**
+ * Collapses the controller suffix only. `ko-Hi6` and `ko-Hi7` are the same
+ * prose branded for two controllers, so keeping both doubles the bytes and
+ * then doubles every search result. A teach-pendant variant like `ko-tp630`
+ * is a genuinely different manual and stays distinct.
+ */
+export function langKey(verId) {
+  return String(verId).replace(/-hi\d[a-z]?$/i, '').toLowerCase();
+}
+
+export function matchesLang(verId, lang) {
   if (!lang) return true;
-  const l = lang.toLowerCase();
-  return (LANG_ALIASES[l] ?? [l]).some((p) => ver.toLowerCase().startsWith(p));
+  const l = String(lang).toLowerCase();
+  return (LANG_ALIASES[l] ?? [l]).some((p) => String(verId).toLowerCase().startsWith(p));
 }
 
 /**
- * Hi6 and Hi7 editions of a manual are separate branches whose markdown is
- * byte-identical — only the `cont_model` variable differs. Collapsing them
- * under one key stops the same page filling two result slots.
+ * One entry per (book, language). A book that ships both a Hi6 and a Hi7
+ * branch in the same language is the same prose twice — fetching both doubles
+ * the bytes and then doubles every search result.
  */
-function langKey(ver) {
-  return ver.replace(/-hi\d[a-z]?$/i, '').toLowerCase();
-}
-
-/** @internal Exported for tests only — see test/lib.test.js. */
-export const matchesLangForTest = matchesLang;
-/** @internal Exported for tests only — see test/lib.test.js. */
-export const langKeyForTest = langKey;
-
-/** Entries whose content lives in a git branch we can fetch, not an external URL. */
-function fetchable(entry) {
-  return !entry.url;
+export function booksForLang(infos, lang) {
+  const seen = new Set();
+  const out = [];
+  for (const e of infos) {
+    if (!fetchable(e)) continue;
+    if (!matchesLang(e.ver_id, lang)) continue;
+    const key = `${e.book_id}/${langKey(e.ver_id)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ book: e.book_id, ver: e.ver_id, title: e.title, variables: e.variables });
+  }
+  return out;
 }
 
 /**
  * Titles alone cannot bridge the vocabulary gap: a user asks about
  * "EtherNet/IP" but the manual is titled "산업용 통신 / Industrial
- * communication", sharing no keyword. These aliases encode that domain
- * knowledge once, in code, for zero tokens per request.
+ * communication", sharing no keyword. Full-text search no longer needs these,
+ * but `hrbook_catalog` matches titles only, so they still earn their place.
  */
 const TOPIC_ALIASES = [
   {
     book: 'doc-industrial-communication',
-    terms: ['ethernet', 'ethernet/ip', 'profinet', 'profibus', 'cc-link', 'cclink',
+    terms: ['ethernet', 'ethernet/ip', 'ethercat', 'profinet', 'profibus', 'cc-link', 'cclink',
       'devicenet', 'modbus', 'fieldbus', 'industrial', '산업용', '통신', '필드버스'],
   },
   { book: 'doc-hi6-open-api', terms: ['api', 'rest', 'http', 'json', 'openapi'] },
@@ -228,13 +194,13 @@ const TOPIC_ALIASES = [
 ];
 
 /**
- * Score bookinfos entries against a query so the *code* can pick which manual
- * to fetch. Doing this in the model instead would mean putting the catalogue
- * in context — 5.4k tokens compacted, 13.7k raw, on every single request — to
- * replace matching that is both free and deterministic here.
+ * Keyword scoring over the catalogue, kept only for `hrbook_catalog` — a
+ * browse-the-titles tool. Search no longer uses it: with every manual indexed
+ * locally the text decides relevance, which is why a query like "초기 설정"
+ * now works despite matching no title and no alias.
  */
 export function rankBooks(query, infos, opts = {}) {
-  const { product, lang, limit = 2 } = opts;
+  const { product, lang, limit = 15 } = opts;
   const lowered = query.toLowerCase();
   const terms = lowered.split(/[\s/]+/).filter((t) => t.length > 1);
   if (terms.length === 0) return [];
@@ -266,8 +232,6 @@ export function rankBooks(query, infos, opts = {}) {
   const seen = new Set();
   const out = [];
   for (const e of scored) {
-    // Keyed by language, not ver_id: fetching both the Hi6 and Hi7 branch
-    // downloads the same bytes twice and then doubles every search result.
     const key = `${e.book_id}/${langKey(e.ver_id)}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -277,163 +241,305 @@ export function rankBooks(query, infos, opts = {}) {
   return out;
 }
 
+// --------------------------------------------------------------- index files
+
+export function indexPath(book, ver) {
+  return path.join(INDEX_DIR, `${book}@${ver}.md`);
+}
+
+/** Written when a repository has no `book.md` at all. Without it the same 404
+ *  is re-requested on every question for the rest of time. */
+function absentPath(book, ver) {
+  return path.join(INDEX_DIR, `${book}@${ver}.none`);
+}
+
+export function bookUrl(book, ver) {
+  return `${RAW_BASE}/${book}/${ver}/book.md`;
+}
+
+export function rawUrl(book, ver, relPath) {
+  const rel = String(relPath).replace(/\\/g, '/').replace(/^\/+/, '');
+  return `${RAW_BASE}/${book}/${ver}/${rel}`;
+}
+
+/** Deep link into the HRBook web viewer for a page. */
+export function viewerUrl(book, ver, relPath, contModel) {
+  const page = String(relPath).replace(/\\/g, '/').replace(/\.md$/i, '');
+  const q = contModel ? `?cont_model=${encodeURIComponent(contModel)}` : '';
+  return `${VIEWER_BASE}/#/view/${book}/${ver}/${page}${q}`;
+}
+
+/** GitBook templating: `${cont_model}` etc. come from the bookinfos entry. */
+export function substitute(text, variables) {
+  if (!variables) return text;
+  return text.replace(/\$\{(\w+)\}/g, (m, key) =>
+    Object.hasOwn(variables, key) ? String(variables[key]) : m,
+  );
+}
+
+/** Runs `fn` over `items` with at most `limit` in flight. */
+export async function pool(items, limit, fn) {
+  const results = [];
+  let next = 0;
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i], i);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 /**
- * Rank pages by where the terms hit: a path or heading match means the page is
- * *about* the topic, whereas a body match may only mention it in passing.
+ * Fetch one manual's index. A 404 is a fact about the repository, not a
+ * failure to retry: a few manuals genuinely ship no `book.md`, and they get a
+ * marker so the table-of-contents fallback handles them instead.
+ */
+export async function fetchIndex(book, ver) {
+  const dest = indexPath(book, ver);
+  try {
+    await download(bookUrl(book, ver), dest);
+    await rm(absentPath(book, ver), { force: true });
+    invalidate(book, ver);
+    return { book, ver, ok: true, bytes: (await stat(dest)).size };
+  } catch (err) {
+    const { status } = await headInfo(bookUrl(book, ver)).catch(() => ({ status: 0 }));
+    if (status === 404) {
+      await mkdir(INDEX_DIR, { recursive: true });
+      await writeFile(absentPath(book, ver), '', 'utf8');
+      return { book, ver, ok: false, absent: true };
+    }
+    return { book, ver, ok: false, error: err.message };
+  }
+}
+
+export function hasIndex(book, ver) {
+  return existsSync(indexPath(book, ver));
+}
+
+export function indexAbsent(book, ver) {
+  return existsSync(absentPath(book, ver));
+}
+
+/** Which entries of a language set still need fetching. */
+export function pendingFor(entries) {
+  return entries.filter((e) => !hasIndex(e.book, e.ver) && !indexAbsent(e.book, e.ver));
+}
+
+export async function fetchIndexSet(entries, { concurrency = CONCURRENCY } = {}) {
+  await mkdir(INDEX_DIR, { recursive: true });
+  const results = await pool(entries, concurrency, (e) => fetchIndex(e.book, e.ver));
+  return {
+    ok: results.filter((r) => r.ok),
+    absent: results.filter((r) => r.absent),
+    failed: results.filter((r) => !r.ok && !r.absent),
+  };
+}
+
+/**
+ * Compare the remote byte count against the copy on disk and re-fetch when it
+ * moved. Only ever called for the handful of manuals a question actually hit,
+ * so it costs one round trip each rather than one per manual in the set.
+ *
+ * Failure is deliberately silent: a blocked proxy must degrade to answering
+ * from the local index, never to refusing to answer.
+ */
+export async function refreshIfChanged(book, ver) {
+  const local = indexPath(book, ver);
+  if (!existsSync(local)) return { book, ver, changed: false, checked: false };
+  try {
+    const [{ status, bytes }, localStat] = await Promise.all([
+      headInfo(bookUrl(book, ver)),
+      stat(local),
+    ]);
+    if (status !== 200 || bytes === 0 || bytes === localStat.size) {
+      return { book, ver, changed: false, checked: true };
+    }
+    await download(bookUrl(book, ver), local);
+    invalidate(book, ver);
+    return { book, ver, changed: true, checked: true, bytes };
+  } catch {
+    return { book, ver, changed: false, checked: false };
+  }
+}
+
+// -------------------------------------------------------------------- search
+
+const SOURCE_RE = /^\[__SOURCE\]\((.+?)\)\s*$/;
+
+/** Every `<book>@<ver>.md` currently on disk, optionally one language only. */
+export async function listIndexes(lang) {
+  if (!existsSync(INDEX_DIR)) return [];
+  const out = [];
+  for (const name of await readdir(INDEX_DIR)) {
+    if (!name.endsWith('.md')) continue;
+    const at = name.lastIndexOf('@');
+    if (at < 0) continue;
+    const book = name.slice(0, at);
+    const ver = name.slice(at + 1, -3);
+    if (lang && !matchesLang(ver, lang)) continue;
+    out.push({ book, ver });
+  }
+  return out;
+}
+
+/**
+ * Split one index into its original pages. The `__SOURCE` marker in front of
+ * each page is what makes a hit in the concatenated text addressable: walking
+ * back to the nearest marker yields the exact path `hrbook_read` needs, with
+ * no table-of-contents lookup and no guessing from heading levels.
+ */
+export function splitSections(text) {
+  const sections = [];
+  let current = null;
+  // The BOM sits in front of the very first marker. Left in place the opening
+  // `[__SOURCE]` fails to match and the whole first page disappears.
+  for (const line of text.replace(/^\uFEFF/, '').split(/\r?\n/)) {
+    const m = line.match(SOURCE_RE);
+    if (m) {
+      current = { path: m[1].trim(), heading: '', lines: [] };
+      sections.push(current);
+      continue;
+    }
+    if (!current) continue;
+    if (!current.heading && /^#{1,6}\s+/.test(line)) {
+      current.heading = line.replace(/^#{1,6}\s+/, '').trim();
+    }
+    current.lines.push(line);
+  }
+  return sections;
+}
+
+const sectionCache = new Map();
+
+async function loadSections(book, ver) {
+  const file = indexPath(book, ver);
+  if (!existsSync(file)) return null;
+  const { mtimeMs, size } = await stat(file);
+  const key = `${book}@${ver}`;
+  const hit = sectionCache.get(key);
+  if (hit && hit.mtimeMs === mtimeMs && hit.size === size) return hit.sections;
+  const sections = splitSections(await readText(file));
+  sectionCache.set(key, { mtimeMs, size, sections });
+  return sections;
+}
+
+/** Dropped when an index is re-fetched, so the next search reads the new text. */
+export function invalidate(book, ver) {
+  sectionCache.delete(`${book}@${ver}`);
+}
+
+function scoreLine(line, terms) {
+  const lowered = line.toLowerCase();
+  let hit = 0;
+  for (const t of terms) if (lowered.includes(t)) hit++;
+  return hit;
+}
+
+/**
+ * Full-text search across the local indexes.
+ *
+ * Scoring is deliberately plain: a line is worth the number of distinct query
+ * terms it contains, and a section takes its best line. Nothing here needs to
+ * be clever, because the model receives the surrounding page and decides for
+ * itself — the job is to narrow ~8 MB down to a handful of addressable pages.
  */
 export async function search(query, opts = {}) {
-  const { product, lang, book: bookFilter, limit = 8 } = opts;
-  const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
-  if (terms.length === 0) return { hits: [], scanned: 0 };
+  const { lang, book, limit = 8 } = opts;
+  const terms = query.toLowerCase().split(/[\s/]+/).filter(Boolean);
+  if (terms.length === 0) return { hits: [], total: 0, scanned: 0 };
 
-  const infos = await loadBookinfos();
-  const cached = await listCached();
+  const targets = (await listIndexes(lang)).filter((t) => !book || t.book === book);
   const hits = [];
   let scanned = 0;
 
-  for (const { book, ver, git } of cached) {
-    if (bookFilter && book !== bookFilter) continue;
-    if (!matchesLang(ver, lang)) continue;
-    const info = meta(infos, book, ver);
-    if (product && info && !info.products?.includes(product.toLowerCase())) continue;
+  for (const t of targets) {
+    const sections = await loadSections(t.book, t.ver);
+    if (!sections) continue;
+    scanned += sections.length;
 
-    const root = git ? path.join(BOOKS_DIR, book) : path.join(BOOKS_DIR, book, ver);
-    let pages;
-    try {
-      pages = await walkMarkdown(root);
-    } catch {
-      continue;
-    }
-    for (const rel of pages) {
-      if (SKIP_FILES.has(path.basename(rel).toLowerCase())) continue;
-      scanned++;
-      const text = await readText(path.join(root, rel));
-      const lower = text.toLowerCase();
-      const relLower = rel.toLowerCase();
-      if (!terms.every((t) => lower.includes(t) || relLower.includes(t))) continue;
-
-      const lines = text.split('\n');
-      const { line, matched } = bestLine(lines, terms);
-
-      const inPath = terms.filter((t) => relLower.includes(t)).length;
-      const heading = headingFor(lines, line);
-      const inHeading = terms.filter((t) => heading.toLowerCase().includes(t)).length;
-      const score = inPath * 10 + inHeading * 5 + matched * 2 + 1;
-
+    for (const s of sections) {
+      let best = 0;
+      let bestLine = '';
+      for (const line of s.lines) {
+        if (!line.trim()) continue;
+        const score = scoreLine(line, terms);
+        if (score > best) {
+          best = score;
+          bestLine = line.trim();
+        }
+        if (best === terms.length) break;
+      }
+      // A heading match counts even when no body line does — section titles
+      // are short and carry the topic.
+      const headScore = scoreLine(`${s.heading} ${s.path}`, terms);
+      const score = Math.max(best, headScore);
+      if (score === 0) continue;
       hits.push({
-        book,
-        ver,
-        git,
-        path: rel,
-        title: info?.title ?? book,
-        heading,
+        book: t.book,
+        ver: t.ver,
+        path: s.path,
+        heading: s.heading,
         score,
-        snippet: substitute(lines[line].trim().slice(0, 200), info?.variables),
-        url: viewerUrl(book, ver, rel, info?.variables?.cont_model),
+        snippet: (bestLine || s.heading).slice(0, 220),
       });
     }
   }
 
-  hits.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path));
-
-  const byPage = new Map();
-  for (const h of hits) {
-    const key = `${h.book}|${langKey(h.ver)}|${h.path}`;
-    const seen = byPage.get(key);
-    if (!seen) {
-      byPage.set(key, { ...h, alsoIn: [] });
-    } else if (!seen.alsoIn.includes(h.ver)) {
-      seen.alsoIn.push(h.ver);
-    }
-  }
-  const unique = [...byPage.values()];
-  return { hits: unique.slice(0, limit), scanned, total: unique.length };
+  hits.sort((a, b) => b.score - a.score);
+  return { hits: hits.slice(0, limit), total: hits.length, scanned };
 }
 
-/** Set HRBOOK_AUTOSYNC=0 where GitHub is blocked and no mirror is configured, so a miss fails fast instead of hanging. */
-export const AUTOSYNC = process.env.HRBOOK_AUTOSYNC !== '0';
+// ---------------------------------------------------------------- page reads
 
 /**
- * Search, and on a miss fetch the manual the query is most likely about and
- * search again. This is what removes the manual setup step: the first question
- * about an unsynced manual costs ~5s once, and every later one is local.
+ * Image links inside `book.md` are still relative to the *original* page, at
+ * whatever depth that page sat (`../_assets/x.png`, `../../_assets/x.png`).
+ * Concatenation left them untouched, so a section lifted out of the index has
+ * to have them resolved against its own `__SOURCE` directory or every image
+ * points nowhere.
+ *
+ * `path.posix` throughout — plain `path.join` on Windows produces backslashes
+ * and silently corrupts the URL.
  */
-export async function searchWithAutoSync(query, opts = {}) {
-  const first = await search(query, opts);
-  if (!AUTOSYNC) return { ...first, synced: [] };
-
-  const infos = await loadBookinfos();
-  const cached = await listCached();
-  const cachedBooks = new Set(cached.map((c) => c.book));
-  const ranked = rankBooks(query, infos, {
-    product: opts.product,
-    lang: opts.lang,
-    limit: 2,
+export function absolutiseLinks(text, book, ver, srcPath) {
+  const dir = path.posix.dirname(String(srcPath).replace(/\\/g, '/'));
+  return text.replace(/(!?\[[^\]]*\])\(([^)]+)\)/g, (whole, label, target) => {
+    const url = target.trim();
+    if (/^(https?:|mailto:|#|\/)/i.test(url)) return whole;
+    const abs = path.posix.normalize(path.posix.join(dir, url));
+    return `${label}(${rawUrl(book, ver, abs)})`;
   });
-
-  const strong = ranked.filter((e) => e.score >= 4);
-
-  const named = opts.book_id ? infos.filter((e) => e.book_id === opts.book_id) : [];
-
-  const wanted = [...named, ...(first.hits.length === 0 ? ranked : strong)].filter(
-    (e, i, a) =>
-      !cachedBooks.has(e.book_id) &&
-      a.findIndex((x) => x.book_id === e.book_id) === i,
-  );
-  if (wanted.length === 0) return { ...first, synced: [] };
-
-  const synced = [];
-  for (const c of wanted) {
-    try {
-      await syncBook(c.book_id, c.ver_id, true);
-      if (opts.lang) {
-        await checkoutBook(c.book_id, c.ver_id);
-      }
-      synced.push(`${c.book_id}/${c.ver_id}`);
-    } catch {
-      continue;
-    }
-  }
-  if (synced.length === 0) return { ...first, synced: [] };
-
-  const second = await search(query, opts);
-  return { ...second, synced };
 }
 
-// ------------------------------------------------------- remote fallback
-//
-// A book that is still downloading used to make the tools answer "not cached",
-// which leaves the user's actual question unanswered for however long the
-// clone takes. The manuals are plain markdown in public repos, so a single
-// page can be fetched over HTTP without any clone at all. That turns the wait
-// into a slower answer instead of no answer, and once the clone lands the
-// same tools silently go back to reading from disk.
+export async function readPage(book, ver, relPath, maxBytes = 12000, variables) {
+  const sections = await loadSections(book, ver);
+  if (!sections) throw new Error(`index not available: ${book}/${ver}`);
 
-const RAW_BASE =
-  process.env.HRBOOK_RAW_BASE || 'https://raw.githubusercontent.com/hyundai-robotics';
+  const want = String(relPath).replace(/\\/g, '/').replace(/^\.?\//, '');
+  const section =
+    sections.find((s) => s.path === want) ||
+    sections.find((s) => s.path.replace(/\.md$/i, '') === want.replace(/\.md$/i, ''));
+  if (!section) throw new Error(`page not in index: ${book}/${ver}/${relPath}`);
 
-export function rawUrl(book, ver, relPath) {
-  const rel = relPath.replace(/\\/g, '/').replace(/^\/+/, '');
-  return `${RAW_BASE}/${book}/${ver}/${rel}`;
+  let text = absolutiseLinks(section.lines.join('\n').trim(), book, ver, section.path);
+  text = substitute(text, variables);
+  const truncated = text.length > maxBytes;
+  return {
+    text: truncated ? text.slice(0, maxBytes) : text,
+    truncated,
+    url: viewerUrl(book, ver, section.path, variables?.cont_model),
+  };
 }
 
-/** curl to a temp file and read it back — same proxy/CA handling as download(). */
-async function fetchText(url) {
-  const tmp = path.join(CACHE, '.tmp', `fetch-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-  try {
-    await download(url, tmp);
-    return await readText(tmp);
-  } finally {
-    await rm(tmp, { force: true });
-  }
-}
+// ----------------------------------------------- fallback for a missing book.md
 
-/** SUMMARY.md is the GitBook table of contents: one markdown link per page. */
 export function parseToc(text) {
   const entries = [];
   const re = /\[([^\]]+)\]\(([^)]+\.md)\)/g;
   let m;
-  while ((m = re.exec(text))) {
+  while ((m = re.exec(text.replace(/^\uFEFF/, '')))) {
     const p = m[2].trim();
     if (/^https?:/i.test(p)) continue;
     entries.push({ title: m[1].trim(), path: p.replace(/^\.\//, '') });
@@ -441,442 +547,74 @@ export function parseToc(text) {
   return entries;
 }
 
-const tocCache = new Map();
-
 export async function remoteToc(book, ver) {
-  const key = `${book}/${ver}`;
-  if (tocCache.has(key)) return tocCache.get(key);
-
-  const entries = parseToc(await fetchText(rawUrl(book, ver, 'SUMMARY.md')));
-  tocCache.set(key, entries);
-  return entries;
+  const tmp = path.join(CACHE, '.tmp', `${book}-${ver}-summary.md`);
+  try {
+    await download(rawUrl(book, ver, 'SUMMARY.md'), tmp);
+    return parseToc(await readText(tmp));
+  } finally {
+    await rm(tmp, { force: true });
+  }
 }
 
-/** Title/path matching against the remote TOC. Deliberately not full text —
- *  one HTTP round trip, not one per page. */
+/** Title/path matching only — used for the manuals that ship no book.md. */
 export async function remoteSearch(query, book, ver, limit = 5) {
   const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
   if (terms.length === 0) return [];
   const entries = await remoteToc(book, ver);
-
   const scored = [];
   for (const e of entries) {
-    const hay = `${e.title} ${e.path}`.toLowerCase();
-    const score = terms.reduce((n, t) => n + (hay.includes(t) ? 1 : 0), 0);
-    if (score > 0) scored.push({ ...e, score });
+    const score = scoreLine(`${e.title} ${e.path}`, terms);
+    if (score > 0) scored.push({ ...e, score, book, ver });
   }
   scored.sort((a, b) => b.score - a.score);
   return scored.slice(0, limit);
 }
 
-export async function readRemotePage(book, ver, relPath, maxBytes = 12000) {
-  const rel = relPath.endsWith('.md') ? relPath : `${relPath}.md`;
-  const infos = await loadBookinfos();
-  const info = meta(infos, book, ver);
-
-  let text = substitute(await fetchText(rawUrl(book, ver, rel)), info?.variables);
-  let truncated = false;
-  if (text.length > maxBytes) {
-    text = text.slice(0, maxBytes);
-    truncated = true;
+export async function readRemotePage(book, ver, relPath, maxBytes = 12000, variables) {
+  const tmp = path.join(CACHE, '.tmp', `${book}-${ver}-page.md`);
+  try {
+    await download(rawUrl(book, ver, relPath), tmp);
+    let text = absolutiseLinks((await readText(tmp)).trim(), book, ver, relPath);
+    text = substitute(text, variables);
+    const truncated = text.length > maxBytes;
+    return {
+      text: truncated ? text.slice(0, maxBytes) : text,
+      truncated,
+      url: viewerUrl(book, ver, relPath, variables?.cont_model),
+    };
+  } finally {
+    await rm(tmp, { force: true });
   }
-  return {
-    text,
-    truncated,
-    url: viewerUrl(book, ver, rel, info?.variables?.cont_model),
-    remote: true,
+}
+
+// ------------------------------------------------------------------- cleanup
+
+/** Size of the abandoned clone tree, so the user can be told what reclaiming
+ *  it is worth. Reported, never deleted. */
+export async function legacyCloneSize() {
+  if (!existsSync(LEGACY_BOOKS_DIR)) return 0;
+  let total = 0;
+  const walk = async (dir) => {
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) await walk(full);
+      else {
+        try {
+          total += (await stat(full)).size;
+        } catch {
+          // A file that vanishes mid-walk is not worth failing over.
+        }
+      }
+    }
   };
-}
-
-export async function readPage(book, ver, relPath, maxBytes = 12000) {
-  const rel = relPath.endsWith('.md') ? relPath : `${relPath}.md`;
-  
-  const bookDir = path.join(BOOKS_DIR, book);
-  const isGit = existsSync(path.join(bookDir, '.git'));
-  const root = isGit ? bookDir : path.join(bookDir, ver);
-  
-  const full = path.resolve(root, rel);
-  if (!full.startsWith(path.resolve(root) + path.sep)) throw new Error('path escapes book root');
-  if (!existsSync(full)) throw new Error(`not cached: ${book}/${ver}/${rel}`);
-
-  const infos = await loadBookinfos();
-  const info = meta(infos, book, ver);
-  let text = substitute(await readText(full), info?.variables);
-  let truncated = false;
-  if (text.length > maxBytes) {
-    text = text.slice(0, maxBytes);
-    truncated = true;
-  }
-  return { text, truncated, url: viewerUrl(book, ver, rel, info?.variables?.cont_model) };
-}
-
-// ---------------------------------------------------------------- sync
-
-export async function refreshBookinfos() {
-  await download(BOOKINFOS_URL, BOOKINFOS);
-  return (await loadBookinfos()).length;
-}
-
-/** Delete everything that is not markdown, plus the directories left empty. */
-async function pruneToMarkdown(dir) {
-  let kept = 0;
-  for (const entry of await readdir(dir, { withFileTypes: true })) {
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      const inner = await pruneToMarkdown(full);
-      if (inner === 0) await rm(full, { recursive: true, force: true });
-      kept += inner;
-    } else if (entry.name.toLowerCase().endsWith('.md')) {
-      kept++;
-    } else {
-      await rm(full, { force: true });
-    }
-  }
-  return kept;
-}
-
-const GIT_REPO_BASE = 'https://github.com/hyundai-robotics';
-
-async function gitClone(book, dest) {
-  await mkdir(path.dirname(dest), { recursive: true });
-  await run('git', ['clone', '--depth', '1', '--no-checkout', `${GIT_REPO_BASE}/${book}.git`, dest]);
-  await run('git', ['-C', dest, 'fetch', 'origin', '+refs/heads/*:refs/remotes/origin/*']);
-}
-
-async function gitCheckout(dest, branch) {
-  await run('git', ['-C', dest, 'checkout', branch]);
-}
-
-async function gitEnsureBranch(dest, branch, { force = false } = {}) {
   try {
-    const { stdout: current } = await run('git', ['-C', dest, 'branch', '--show-current']);
-    const currentBranch = current.trim();
-    // `force` is set right after a clone. `gitClone` uses `--no-checkout`, so
-    // HEAD already names a branch while the working tree is still empty — and
-    // when `ver` happens to equal the repo's default branch, the early return
-    // below would skip the checkout entirely and leave a book with no markdown
-    // in it. That used to pass silently; `syncBook` now rejects it.
-    if (!force && currentBranch === branch) return;
-    
-    await run('git', ['-C', dest, 'fetch', 'origin', `refs/heads/${branch}:refs/remotes/origin/${branch}`]);
-    await run('git', ['-C', dest, 'checkout', branch]);
+    await walk(LEGACY_BOOKS_DIR);
   } catch {
-    // Not `--unshallow`. The clone above is `--depth 1`; unshallowing pulls the
-    // entire history of a manual repo back down, which is minutes per book on a
-    // proxied network — and this catch is reached by any branch-name mismatch,
-    // so it is the common path rather than the rare one. One shallow ref is all
-    // a checkout needs.
-    await run('git', [
-      '-C', dest, 'fetch', '--depth', '1', 'origin',
-      `refs/heads/${branch}:refs/remotes/origin/${branch}`,
-    ]);
-    try {
-      await run('git', ['-C', dest, 'checkout', '-b', branch, `origin/${branch}`]);
-    } catch (err) {
-      throw new Error(`Failed to checkout branch ${branch}: ${err.message}`);
-    }
+    return total;
   }
+  return total;
 }
 
-/**
- * Written only once a book is fully cloned, checked out and confirmed to hold
- * markdown.
- *
- * Without it an interrupted clone is indistinguishable from a finished one:
- * `gitClone` uses `--no-checkout`, so killing opencode between the clone and
- * `gitEnsureBranch` leaves a valid `.git` on disk with no pages in the working
- * tree. `listCached()` then counts that book as present and the initial sync
- * skips it forever — the book silently never becomes searchable. Interrupting
- * is the normal case here, not the rare one: a full sync runs for tens of
- * minutes and the whole point of the redesign is that the user can keep
- * working (and therefore keep quitting) while it does.
- */
-const MARKER = '.hrbook-ok';
-
-export function isBookComplete(book) {
-  return existsSync(path.join(BOOKS_DIR, book, MARKER));
-}
-
-export async function syncBook(book, ver, useGit = false) {
-  const dest = path.join(BOOKS_DIR, book);
-
-  if (useGit) {
-    // A directory without `.git` is debris, not a repo.
-    if (existsSync(dest) && !existsSync(path.join(dest, '.git'))) {
-      await rm(dest, { recursive: true, force: true });
-    }
-
-    const fresh = !existsSync(dest);
-    if (fresh) await gitClone(book, dest);
-
-    // Anything without the marker is either brand new or an interrupted
-    // clone, and both leave an empty working tree behind `--no-checkout`.
-    // Forcing the checkout is what repairs the interrupted case: without it
-    // `gitEnsureBranch` sees HEAD already naming the wanted branch and returns
-    // without ever populating the tree, so the book fails on every retry
-    // forever. Quitting mid-clone is normal here, so this path has to heal.
-    let pages = [];
-    try {
-      await gitEnsureBranch(dest, ver, { force: true });
-      pages = await walkMarkdown(dest);
-    } catch {
-      pages = [];
-    }
-
-    // Still empty — the repo itself is damaged. Throw it away and start over.
-    if (pages.length === 0) {
-      await rm(dest, { recursive: true, force: true });
-      await gitClone(book, dest);
-      await gitEnsureBranch(dest, ver, { force: true });
-      pages = await walkMarkdown(dest);
-    }
-
-    if (pages.length === 0) {
-      throw new Error(`${book}/${ver}: checkout produced no markdown`);
-    }
-
-    await writeFile(
-      path.join(dest, MARKER),
-      JSON.stringify({ ver, pages: pages.length, at: new Date().toISOString() }),
-      'utf8',
-    );
-    return pages.length;
-  } else {
-    const tmp = path.join(CACHE, '.tmp', `${book}-${ver}`);
-    const tgz = `${tmp}.tar.gz`;
-    const verDest = path.join(dest, ver);
-
-    try {
-      await download(`${TARBALL_BASE}/${book}/tar.gz/${ver}`, tgz);
-      await rm(tmp, { recursive: true, force: true });
-      await mkdir(tmp, { recursive: true });
-      await run('tar', ['xzf', tgz, '-C', tmp, '--strip-components=1']);
-
-      const kept = await pruneToMarkdown(tmp);
-      await rm(verDest, { recursive: true, force: true });
-      await mkdir(path.dirname(verDest), { recursive: true });
-      await rename(tmp, verDest);
-      return kept;
-    } finally {
-      await rm(tgz, { force: true });
-      await rm(tmp, { recursive: true, force: true });
-    }
-  }
-}
-
-export async function checkoutBook(book, ver) {
-  const dest = path.join(BOOKS_DIR, book);
-  if (!existsSync(dest)) {
-    await syncBook(book, ver, true);
-  } else {
-    await gitEnsureBranch(dest, ver);
-  }
-}
-
-export async function getBookCurrentBranch(book) {
-  const dest = path.join(BOOKS_DIR, book);
-  if (!existsSync(dest)) return null;
-  
-  const gitDir = path.join(dest, '.git');
-  if (!existsSync(gitDir)) return null;
-  
-  try {
-    const { stdout } = await run('git', ['-C', dest, 'branch', '--show-current']);
-    return stdout.trim();
-  } catch {
-    return null;
-  }
-}
-
-export async function checkBookHasUpdates(book, targetBranch) {
-  const dest = path.join(BOOKS_DIR, book);
-  if (!existsSync(dest)) return { needsSync: true, reason: 'not-cloned' };
-  
-  const gitDir = path.join(dest, '.git');
-  if (!existsSync(gitDir)) return { needsSync: false, reason: 'not-git' };
-  
-  try {
-    await run('git', ['-C', dest, 'fetch', 'origin', targetBranch]);
-    const { stdout: local } = await run('git', ['-C', dest, 'rev-parse', 'HEAD']);
-    const { stdout: remote } = await run('git', ['-C', dest, 'rev-parse', `origin/${targetBranch}`]);
-    
-    if (local.trim() !== remote.trim()) {
-      return { needsSync: true, reason: 'updates-available' };
-    }
-    return { needsSync: false, reason: 'up-to-date' };
-  } catch {
-    return { needsSync: false, reason: 'check-failed' };
-  }
-}
-
-export async function checkAllBooksUpdates() {
-  const infos = await loadBookinfos();
-  const fetchable = infos.filter((e) => !e.url);
-  
-  const byBook = new Map();
-  for (const entry of fetchable) {
-    if (!byBook.has(entry.book_id)) {
-      byBook.set(entry.book_id, entry.ver_id);
-    }
-  }
-  
-  const updates = [];
-  for (const [bookId, verId] of byBook) {
-    const currentBranch = await getBookCurrentBranch(bookId);
-    if (!currentBranch) {
-      updates.push({ book: bookId, target: verId, current: null, needsSync: true });
-    } else {
-      const status = await checkBookHasUpdates(bookId, verId);
-      if (status.needsSync) {
-        updates.push({ book: bookId, target: verId, current: currentBranch, needsSync: true });
-      }
-    }
-  }
-  
-  return updates;
-}
-
-let pendingSyncCount = 0;
-
-export async function checkPendingSync() {
-  if (pendingSyncCount > 0) return pendingSyncCount;
-  try {
-    const updates = await checkAllBooksUpdates();
-    pendingSyncCount = updates.length;
-    return pendingSyncCount;
-  } catch {
-    return 0;
-  }
-}
-
-export function resetPendingSync() {
-  pendingSyncCount = 0;
-}
-
-export async function writeManifest(entries) {
-  await writeFile(
-    path.join(CACHE, 'manifest.json'),
-    JSON.stringify({ syncedAt: new Date().toISOString(), books: entries }, null, 2),
-  );
-}
-
-export async function loadSyncManifest() {
-  if (!existsSync(SYNC_MANIFEST)) return { lastSync: null, books: {} };
-  try {
-    return JSON.parse(await readText(SYNC_MANIFEST));
-  } catch {
-    return { lastSync: null, books: {} };
-  }
-}
-
-export async function saveSyncManifest(lastSync, books) {
-  await mkdir(CACHE, { recursive: true });
-  await writeFile(
-    SYNC_MANIFEST,
-    JSON.stringify({ lastSync, books }, null, 2),
-  );
-}
-
-export async function syncAllBooks(progressCallback) {
-  const infos = await loadBookinfos();
-  const cached = await listCached();
-  const cachedKeys = new Set(cached.map((c) => `${c.book}/${c.ver}`));
-  
-  // `const fetchable = infos.filter(fetchable)` shadowed the module-level
-  // helper with a const in the same scope, so the initialiser referenced the
-  // binding inside its own TDZ and every call threw
-  // `ReferenceError: Cannot access 'fetchable' before initialization`.
-  const targets = infos.filter((e) => fetchable(e));
-
-  const byBook = new Map();
-  for (const entry of targets) {
-    if (!byBook.has(entry.book_id)) {
-      byBook.set(entry.book_id, new Set());
-    }
-    byBook.get(entry.book_id).add(entry.ver_id);
-  }
-  
-  const totalBooks = byBook.size;
-  const synced = [];
-  const failed = [];
-  
-  if (progressCallback) {
-    progressCallback({ type: 'start', total: totalBooks, synced: 0, failed: 0 });
-  }
-  
-  for (const [bookId, versions] of byBook) {
-    for (const verId of versions) {
-      const key = `${bookId}/${verId}`;
-      
-      if (cachedKeys.has(key)) {
-        if (progressCallback) {
-          progressCallback({ type: 'skip', book: bookId, ver: verId, synced: synced.length, failed: failed.length });
-        }
-        continue;
-      }
-      
-      try {
-        await syncBook(bookId, verId);
-        synced.push(key);
-        if (progressCallback) {
-          progressCallback({ type: 'success', book: bookId, ver: verId, synced: synced.length, failed: failed.length });
-        }
-      } catch (err) {
-        failed.push({ book: bookId, ver: verId, error: err.message });
-        if (progressCallback) {
-          progressCallback({ type: 'error', book: bookId, ver: verId, error: err.message, synced: synced.length, failed: failed.length });
-        }
-      }
-    }
-  }
-  
-  if (progressCallback) {
-    progressCallback({ type: 'complete', synced, failed, total: totalBooks });
-  }
-  
-  return { synced, failed, total: totalBooks };
-}
-
-export async function checkBookUpdates() {
-  const manifest = await loadSyncManifest();
-  const infos = await loadBookinfos();
-  const updates = [];
-  
-  for (const entry of infos) {
-    if (entry.url) continue;
-    
-    const key = `${entry.book_id}/${entry.ver_id}`;
-    const lastInfo = manifest.books?.[key];
-    
-    try {
-      const { stdout } = await run('curl', [
-        '-sI',
-        `${TARBALL_BASE}/${entry.book_id}/tar.gz/${entry.ver_id}`,
-      ]);
-      
-      const etagMatch = stdout.match(/ETag:\s*"([^"]+)"/i);
-      const currentHash = etagMatch ? etagMatch[1] : null;
-      
-      if (!lastInfo || lastInfo.hash !== currentHash) {
-        updates.push({
-          book: entry.book_id,
-          ver: entry.ver_id,
-          title: entry.title,
-          currentHash,
-          lastHash: lastInfo?.hash,
-        });
-      }
-    } catch {
-      continue;
-    }
-  }
-  
-  return updates;
-}
-
-export async function updateSyncManifestEntry(book, ver, hash) {
-  const manifest = await loadSyncManifest();
-  if (!manifest.books) manifest.books = {};
-  manifest.books[`${book}/${ver}`] = { hash, syncedAt: new Date().toISOString() };
-  await saveSyncManifest(new Date().toISOString(), manifest.books);
-}
+export const langKeyForTest = langKey;
+export const matchesLangForTest = matchesLang;
