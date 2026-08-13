@@ -1,0 +1,1389 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HD Hyundai Robotics Open Stream Protocol Guide</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <style>
+        :root {
+            --primary-color: #0066cc;
+            --secondary-color: #004a99;
+            --accent-color: #00cc99;
+            --warning-color: #ff9900;
+            --error-color: #cc0033;
+            --success-color: #009966;
+            --bg-color: #f8f9fa;
+            --card-bg: #ffffff;
+            --text-color: #333333;
+            --text-muted: #666666;
+            --border-color: #e0e0e0;
+            --code-bg: #2d2d2d;
+            --code-text: #f8f8f2;
+        }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Malgun Gothic', '맑은 고딕', sans-serif;
+            line-height: 1.6;
+            color: var(--text-color);
+            background: var(--bg-color);
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        header {
+            background: linear-gradient(135deg, var(--primary-color), var(--secondary-color));
+            color: white;
+            padding: 40px 20px;
+            text-align: center;
+            margin-bottom: 40px;
+            border-radius: 12px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+        }
+        
+        header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            font-weight: 700;
+        }
+        
+        header p {
+            font-size: 1.2em;
+            opacity: 0.95;
+        }
+        
+        section {
+            background: var(--card-bg);
+            border-radius: 12px;
+            padding: 30px;
+            margin-bottom: 30px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+        }
+        
+        h2 {
+            color: var(--primary-color);
+            font-size: 1.8em;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 3px solid var(--accent-color);
+        }
+        
+        h3 {
+            color: var(--secondary-color);
+            font-size: 1.4em;
+            margin: 25px 0 15px 0;
+        }
+        
+        h4 {
+            color: var(--text-color);
+            font-size: 1.1em;
+            margin: 20px 0 10px 0;
+        }
+        
+        /* Feature Cards */
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 20px;
+            margin: 20px 0;
+        }
+        
+        .feature-card {
+            background: linear-gradient(135deg, #f0f7ff, #e8f4f8);
+            border-left: 4px solid var(--primary-color);
+            padding: 20px;
+            border-radius: 8px;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        
+        .feature-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0, 102, 204, 0.2);
+        }
+        
+        .feature-card h4 {
+            color: var(--primary-color);
+            margin-bottom: 10px;
+        }
+        
+        /* Callout Boxes */
+        .callout {
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 8px;
+            border-left: 4px solid;
+        }
+        
+        .callout.info {
+            background: #e7f3ff;
+            border-color: #0066cc;
+        }
+        
+        .callout.warning {
+            background: #fff3e0;
+            border-color: var(--warning-color);
+        }
+        
+        .callout.error {
+            background: #ffebee;
+            border-color: var(--error-color);
+        }
+        
+        .callout.success {
+            background: #e8f5e9;
+            border-color: var(--success-color);
+        }
+        
+        .callout-title {
+            font-weight: 600;
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        /* Tables */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+            font-size: 0.95em;
+        }
+        
+        th, td {
+            padding: 12px 15px;
+            text-align: left;
+            border: 1px solid var(--border-color);
+        }
+        
+        th {
+            background: var(--primary-color);
+            color: white;
+            font-weight: 600;
+        }
+        
+        tr:nth-child(even) {
+            background: #f8f9fa;
+        }
+        
+        tr:hover {
+            background: #e8f4f8;
+        }
+        
+        code {
+            font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+            background: #f0f0f0;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 0.9em;
+            color: #d63384;
+        }
+        
+        pre {
+            background: var(--code-bg);
+            color: var(--code-text);
+            padding: 20px;
+            border-radius: 8px;
+            overflow-x: auto;
+            margin: 15px 0;
+            font-size: 0.9em;
+            line-height: 1.5;
+        }
+        
+        pre code {
+            background: transparent;
+            color: inherit;
+            padding: 0;
+        }
+        
+        /* Mermaid Diagrams */
+        .mermaid {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+            text-align: center;
+        }
+        
+        /* Command Reference */
+        .command-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin: 20px 0;
+        }
+        
+        .command-card {
+            background: white;
+            border: 2px solid var(--border-color);
+            border-radius: 8px;
+            padding: 20px;
+            transition: border-color 0.2s;
+        }
+        
+        .command-card:hover {
+            border-color: var(--primary-color);
+        }
+        
+        .command-card .cmd-name {
+            font-size: 1.3em;
+            font-weight: 700;
+            color: var(--primary-color);
+            margin-bottom: 10px;
+        }
+        
+        .command-card .cmd-desc {
+            color: var(--text-muted);
+            font-size: 0.95em;
+        }
+        
+        /* Performance Metrics */
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin: 20px 0;
+        }
+        
+        .metric-card {
+            background: linear-gradient(135deg, var(--primary-color), var(--secondary-color));
+            color: white;
+            padding: 25px;
+            border-radius: 12px;
+            text-align: center;
+        }
+        
+        .metric-card .value {
+            font-size: 2.5em;
+            font-weight: 700;
+            margin-bottom: 5px;
+        }
+        
+        .metric-card .label {
+            font-size: 0.9em;
+            opacity: 0.9;
+        }
+        
+        /* Navigation */
+        nav {
+            background: white;
+            padding: 15px 20px;
+            border-radius: 8px;
+            margin-bottom: 30px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+        }
+        
+        nav ul {
+            list-style: none;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 15px;
+            justify-content: center;
+        }
+        
+        nav a {
+            color: var(--primary-color);
+            text-decoration: none;
+            padding: 8px 15px;
+            border-radius: 6px;
+            transition: background 0.2s;
+        }
+        
+        nav a:hover {
+            background: #e8f4f8;
+        }
+        
+        /* Responsive */
+        @media (max-width: 768px) {
+            header h1 {
+                font-size: 1.8em;
+            }
+            
+            section {
+                padding: 20px;
+            }
+            
+            nav ul {
+                flex-direction: column;
+                align-items: center;
+            }
+        }
+        
+        /* Syntax Highlighting */
+        .json-key { color: #f8f8f2; }
+        .json-string { color: #a6e22e; }
+        .json-number { color: #ae81ff; }
+        .json-boolean { color: #66d9ef; }
+        
+        /* Badge */
+        .badge {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 0.8em;
+            font-weight: 600;
+            margin-left: 10px;
+        }
+        
+        .badge.required {
+            background: var(--error-color);
+            color: white;
+        }
+        
+        .badge.optional {
+            background: var(--accent-color);
+            color: white;
+        }
+        
+        .badge.deprecated {
+            background: var(--warning-color);
+            color: white;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>HD Hyundai Robotics Open Stream Protocol</h1>
+            <p>Real-time TCP Streaming Interface for Hi6 Controller</p>
+        </header>
+
+        <nav>
+            <ul>
+                <li><a href="#overview">Overview</a></li>
+                <li><a href="#features">Key Features</a></li>
+                <li><a href="#protocol-flow">Protocol Flow</a></li>
+                <li><a href="#commands">Commands</a></li>
+                <li><a href="#technical-details">Technical Details</a></li>
+                <li><a href="#examples">Examples</a></li>
+                <li><a href="#performance">Performance</a></li>
+                <li><a href="#best-practices">Best Practices</a></li>
+            </ul>
+        </nav>
+
+        <!-- Overview Section -->
+        <section id="overview">
+            <h2>📋 What is Open Stream?</h2>
+            <p>
+                Open Stream is a <strong>TCP-based streaming interface</strong> for HD Hyundai Robotics Hi6 controllers that enables 
+                real-time bidirectional communication with low-latency data streaming. Unlike traditional HTTP-based OpenAPI 
+                that requires repeated request/response cycles, Open Stream maintains a single long-lived TCP connection for 
+                efficient continuous data exchange.
+            </p>
+            
+            <div class="callout info">
+                <div class="callout-title">💡 Core Concept</div>
+                <p>Open Stream allows external clients to continuously send and receive data through a lightweight TCP server 
+                built into the Hi6 controller, using NDJSON (Newline Delimited JSON) format for message framing.</p>
+            </div>
+
+            <h3>Basic Flow</h3>
+            <ol style="margin-left: 20px; line-height: 1.8;">
+                <li>Client establishes TCP connection to server (port 49000)</li>
+                <li>Client sends <code>HANDSHAKE</code> command for version negotiation</li>
+                <li>Server responds with <code>handshake_ack</code> event</li>
+                <li>Client can then use <code>MONITOR</code> for periodic streaming or <code>CONTROL</code> for commands</li>
+                <li>Server periodically sends <code>data</code> events when MONITOR is active</li>
+                <li>Client sends <code>STOP</code> to terminate session and closes TCP connection</li>
+            </ol>
+        </section>
+
+        <!-- Key Features Section -->
+        <section id="features">
+            <h2>✨ Key Features</h2>
+            <div class="features-grid">
+                <div class="feature-card">
+                    <h4>🔗 Long-Lived TCP Connection</h4>
+                    <p>Single persistent TCP connection eliminates connection overhead and enables real-time streaming with minimal latency.</p>
+                </div>
+                <div class="feature-card">
+                    <h4>📦 NDJSON Format</h4>
+                    <p>Newline Delimited JSON ensures simple, efficient message framing. Each message is exactly one JSON line terminated with <code>\n</code>.</p>
+                </div>
+                <div class="feature-card">
+                    <h4>👁️ MONITOR + CONTROL</h4>
+                    <p>Simultaneously support periodic data streaming (MONITOR) and command execution (CONTROL) within the same connection.</p>
+                </div>
+                <div class="feature-card">
+                    <h4>⚡ Low Latency</h4>
+                    <p>Achieves ~2.0ms cycle time for MONITOR-only streaming, ~2.1-2.2ms with CONTROL commands.</p>
+                </div>
+                <div class="feature-card">
+                    <h4>🔄 Async Event Stream</h4>
+                    <p>Server pushes data events asynchronously without requiring explicit requests. Event order is not guaranteed.</p>
+                </div>
+                <div class="feature-card">
+                    <h4>🛡️ Watchdog Protection</h4>
+                    <p>Automatic session timeout: 180s idle, 5s when MONITOR active. Prevents zombie connections.</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Protocol Flow Diagrams Section -->
+        <section id="protocol-flow">
+            <h2>🔄 Protocol Flow Diagrams</h2>
+
+            <h3>1. Complete Session Lifecycle</h3>
+            <div class="mermaid">
+sequenceDiagram
+    participant C as Client
+    participant S as Open Stream Server
+
+    Note over C,S: Phase 1: Connection & Handshake
+    C->>S: TCP Connect (port 49000)
+    C->>S: {"cmd":"HANDSHAKE","payload":{"major":1}}
+    S->>C: {"type":"handshake_ack","ok":true,"version":"1.0.0"}
+
+    Note over C,S: Phase 2: MONITOR Setup
+    C->>S: {"cmd":"MONITOR","payload":{"method":"GET","url":"/project/robot/joints","period_ms":2}}
+    S->>C: {"type":"monitor_ack"}
+    S->>C: {"type":"data","ts":123,"svc_dur_ms":0.42,"result":{...}}
+    S->>C: {"type":"data","ts":125,"svc_dur_ms":0.38,"result":{...}}
+    S->>C: {"type":"data","ts":127,"svc_dur_ms":0.45,"result":{...}}
+
+    Note over C,S: Phase 3: CONTROL (during MONITOR)
+    C->>S: {"cmd":"CONTROL","payload":{"method":"POST","url":"/project/robot/trajectory",...}}
+    Note right of S: No ACK on success
+    S->>C: {"type":"control_err","status":400,"body":{...}}
+    Note right of S: Only on error
+
+    Note over C,S: Phase 4: Session Termination
+    C->>S: {"cmd":"STOP","payload":{"target":"session"}}
+    S->>C: {"type":"stop_ack","target":"session"}
+    C->>S: TCP Close
+            </div>
+
+            <h3>2. MONITOR-Only Scenario</h3>
+            <div class="mermaid">
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+
+    C->>S: HANDSHAKE
+    S->>C: handshake_ack
+    C->>S: MONITOR (period_ms=2)
+    S->>C: monitor_ack
+    loop Every 2ms
+        S->>C: data (ts, svc_dur_ms, result)
+    end
+    C->>S: STOP (target=monitor)
+    S->>C: stop_ack
+            </div>
+
+            <h3>3. CONTROL-Only Scenario</h3>
+            <div class="mermaid">
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+
+    C->>S: HANDSHAKE
+    S->>C: handshake_ack
+    C->>S: CONTROL (POST /trajectory)
+    Note right of S: Silent success (no response)
+    C->>S: CONTROL (POST /trajectory)
+    Note right of S: Silent success
+    alt Error Occurs
+        S->>C: control_err (status, body)
+    end
+    C->>S: STOP (target=session)
+    S->>C: stop_ack
+            </div>
+
+            <h3>4. Combined MONITOR + CONTROL</h3>
+            <div class="mermaid">
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+
+    C->>S: HANDSHAKE
+    S->>C: handshake_ack
+    C->>S: MONITOR (period_ms=2)
+    S->>C: monitor_ack
+    
+    loop Real-time Control Loop
+        S->>C: data (robot state)
+        C->>S: CONTROL (compute & send command)
+        Note right of S: No ACK if success
+        S->>C: data (updated state)
+    end
+    
+    C->>S: STOP (target=session)
+    S->>C: stop_ack
+            </div>
+
+            <h3>5. Error Handling Flow</h3>
+            <div class="mermaid">
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+
+    C->>S: HANDSHAKE (wrong version)
+    S->>C: {"error":"version_mismatch","message":"..."}
+    
+    C->>S: MONITOR (before HANDSHAKE)
+    S->>C: {"error":"handshake_required","message":"..."}
+    
+    C->>S: HANDSHAKE
+    S->>C: handshake_ack
+    C->>S: CONTROL (invalid URL)
+    S->>C: {"type":"control_err","status":400,"body":{...}}
+    
+    Note over C,S: Client must handle errors asynchronously<br/>and decide: retry, STOP, or reconnect
+            </div>
+        </section>
+
+        <!-- Command Reference Section -->
+        <section id="commands">
+            <h2>📚 Command Reference</h2>
+
+            <div class="command-grid">
+                <div class="command-card">
+                    <div class="cmd-name">HANDSHAKE <span class="badge required">Required</span></div>
+                    <div class="cmd-desc">Version negotiation. Must be first command after TCP connection.</div>
+                </div>
+                <div class="command-card">
+                    <div class="cmd-name">MONITOR <span class="badge required">Required for streaming</span></div>
+                    <div class="cmd-desc">Periodic GET requests with data streaming. Server pushes data every period_ms.</div>
+                </div>
+                <div class="command-card">
+                    <div class="cmd-name">CONTROL <span class="badge optional">Optional</span></div>
+                    <div class="cmd-desc">Single POST/PUT/DELETE command execution. No success response (silent ACK).</div>
+                </div>
+                <div class="command-card">
+                    <div class="cmd-name">STOP <span class="badge optional">Optional</span></div>
+                    <div class="cmd-desc">Terminate monitor/control/session. Always use for clean shutdown.</div>
+                </div>
+            </div>
+
+            <h3>Command Details</h3>
+
+            <h4>1. HANDSHAKE</h4>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Field</th>
+                        <th>Required</th>
+                        <th>Type</th>
+                        <th>Description</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>major</code></td>
+                        <td><span class="badge required">Yes</span></td>
+                        <td>int</td>
+                        <td>Protocol major version (0 or positive integer)</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h5>Request Example:</h5>
+            <pre><code class="language-json">{"cmd":"HANDSHAKE","payload":{"major":1}}</code></pre>
+
+            <h5>Success Response:</h5>
+            <pre><code class="language-json">{"type":"handshake_ack","ok":true,"version":"1.0.0"}</code></pre>
+
+            <h5>Error Codes:</h5>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Error Code</th>
+                        <th>HTTP Status</th>
+                        <th>When It Occurs</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>version_mismatch</code></td>
+                        <td>400</td>
+                        <td>Client major version doesn't match server</td>
+                    </tr>
+                    <tr>
+                        <td><code>busy_session_active</code></td>
+                        <td>409</td>
+                        <td>Handshake attempted during active CONTROL/MONITOR</td>
+                    </tr>
+                    <tr>
+                        <td><code>missing_major</code></td>
+                        <td>400</td>
+                        <td><code>major</code> field is missing</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h4>2. MONITOR</h4>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Field</th>
+                        <th>Required</th>
+                        <th>Type</th>
+                        <th>Rules</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>url</code></td>
+                        <td><span class="badge required">Yes</span></td>
+                        <td>string</td>
+                        <td>Starts with <code>/</code>, no spaces, max 2048 chars</td>
+                    </tr>
+                    <tr>
+                        <td><code>method</code></td>
+                        <td><span class="badge required">Yes</span></td>
+                        <td>string</td>
+                        <td>Must be <code>"GET"</code></td>
+                    </tr>
+                    <tr>
+                        <td><code>period_ms</code></td>
+                        <td><span class="badge required">Yes</span></td>
+                        <td>int</td>
+                        <td>2 ~ 30000 ms (auto-clamped if out of range)</td>
+                    </tr>
+                    <tr>
+                        <td><code>args</code></td>
+                        <td><span class="badge optional">No</span></td>
+                        <td>object</td>
+                        <td>Query parameters (JSON object only)</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h5>Request Example:</h5>
+            <pre><code class="language-json">{"cmd":"MONITOR","payload":{"method":"GET","period_ms":2,"url":"/project/robot/joints/joint_states","args":{"jno_start":1,"jno_n":6}}}</code></pre>
+
+            <h5>Success Response (ACK):</h5>
+            <pre><code class="language-json">{"type":"monitor_ack"}</code></pre>
+
+            <h5>Success Response (Streaming Data):</h5>
+            <pre><code class="language-json">{"type":"data","ts":402,"svc_dur_ms":2.96,"result":{"_type":"JObject","position":[0.0,90.0,0.0,0.0,-90.0,0.0],"effort":[-0.0,98.92,94.60,-0.11,-5.90,0.0],"velocity":[-0.0,-0.0,0.0,0.0,-0.0,0.0]}}</code></pre>
+
+            <h4>3. CONTROL</h4>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Field</th>
+                        <th>Required</th>
+                        <th>Type</th>
+                        <th>Rules</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>url</code></td>
+                        <td><span class="badge required">Yes</span></td>
+                        <td>string</td>
+                        <td>Starts with <code>/</code>, no spaces</td>
+                    </tr>
+                    <tr>
+                        <td><code>method</code></td>
+                        <td><span class="badge required">Yes</span></td>
+                        <td>string</td>
+                        <td><code>"POST"</code>, <code>"PUT"</code>, or <code>"DELETE"</code></td>
+                    </tr>
+                    <tr>
+                        <td><code>args</code></td>
+                        <td><span class="badge optional">No</span></td>
+                        <td>object</td>
+                        <td>Query parameters</td>
+                    </tr>
+                    <tr>
+                        <td><code>body</code></td>
+                        <td><span class="badge optional">No</span></td>
+                        <td>object|array</td>
+                        <td>Request body (JSON object or array)</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h5>Request Example:</h5>
+            <pre><code class="language-json">{"cmd":"CONTROL","payload":{"method":"POST","url":"/project/robot/trajectory/joint_traject_insert_point","args":{},"body":{"interval":0.005,"time_from_start":-1,"look_ahead_time":0.004,"point":[1.01,91.01,1.01,1.01,1.01,0.01]}}}</code></pre>
+
+            <h5>Success Response:</h5>
+            <div class="callout success">
+                <div class="callout-title">✓ Silent Success</div>
+                <p>CONTROL succeeds without any response line. Only errors generate <code>control_err</code> events.</p>
+            </div>
+
+            <h5>Error Response:</h5>
+            <pre><code class="language-json">{"type":"control_err","status":400,"body":{"error":"invalid_url","message":"..."}}</code></pre>
+
+            <h4>4. STOP</h4>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Field</th>
+                        <th>Required</th>
+                        <th>Type</th>
+                        <th>Values</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>target</code></td>
+                        <td><span class="badge required">Yes</span></td>
+                        <td>string</td>
+                        <td><code>"session"</code>, <code>"monitor"</code>, or <code>"control"</code></td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h5>Request Example:</h5>
+            <pre><code class="language-json">{"cmd":"STOP","payload":{"target":"session"}}</code></pre>
+
+            <h5>Success Response:</h5>
+            <pre><code class="language-json">{"type":"stop_ack","target":"session"}</code></pre>
+        </section>
+
+        <!-- Technical Details Section -->
+        <section id="technical-details">
+            <h2>⚙️ Key Technical Details</h2>
+
+            <h3>Connection Specifications</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Parameter</th>
+                        <th>Value</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>TCP Port</td>
+                        <td><code>49000</code></td>
+                    </tr>
+                    <tr>
+                        <td>Message Format</td>
+                        <td>NDJSON (JSON + newline <code>\n</code>)</td>
+                    </tr>
+                    <tr>
+                        <td>Encoding</td>
+                        <td>UTF-8</td>
+                    </tr>
+                    <tr>
+                        <td>Socket Options</td>
+                        <td><code>TCP_NODELAY</code> (Nagle OFF), <code>SO_KEEPALIVE</code></td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h3>Timing Specifications</h3>
+            <div class="metrics-grid">
+                <div class="metric-card">
+                    <div class="value">2ms</div>
+                    <div class="label">Minimum MONITOR Period</div>
+                </div>
+                <div class="metric-card">
+                    <div class="value">~2.0ms</div>
+                    <div class="label">MONITOR-Only Cycle Time</div>
+                </div>
+                <div class="metric-card">
+                    <div class="value">~2.1-2.2ms</div>
+                    <div class="label">MONITOR+CONTROL with Jitter</div>
+                </div>
+                <div class="metric-card">
+                    <div class="value">180s</div>
+                    <div class="label">Idle Timeout (No MONITOR)</div>
+                </div>
+                <div class="metric-card">
+                    <div class="value">5s</div>
+                    <div class="label">Active Timeout (MONITOR Running)</div>
+                </div>
+            </div>
+
+            <h3>Watchdog Behavior</h3>
+            <div class="callout info">
+                <div class="callout-title">🛡️ Watchdog Timer</div>
+                <p><strong>Idle State (No MONITOR):</strong> Session terminates after ~180 seconds of inactivity</p>
+                <p><strong>Armed State (MONITOR Active):</strong> Session terminates after ~5 seconds without streaming</p>
+                <p style="margin-top: 10px;"><em>Note: Watchdog timer resets on successful CONTROL execution</em></p>
+            </div>
+
+            <h3>NDJSON Message Format</h3>
+            <div class="callout warning">
+                <div class="callout-title">⚠️ Critical Rules</div>
+                <ol style="margin-left: 20px; margin-top: 10px;">
+                    <li>Every message is exactly one JSON object serialized as a single line</li>
+                    <li>Every message MUST end with newline character <code>\n</code></li>
+                    <li>No newlines allowed inside JSON strings (breaks framing)</li>
+                    <li>Use compact JSON serialization (no extra whitespace)</li>
+                </ol>
+            </div>
+
+            <h5>Example Messages:</h5>
+            <pre><code>Client → Server: {"cmd":"HANDSHAKE","payload":{"major":1}}\n
+Server → Client: {"type":"handshake_ack","ok":true,"version":"1.0.0"}\n
+Server → Client: {"type":"data","ts":1730000000000,"svc_dur_ms":0.42,"result":{...}}\n</code></pre>
+
+            <h3>Error Codes Reference</h3>
+
+            <h4>Protocol / Session Errors</h4>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Error Code</th>
+                        <th>Description</th>
+                        <th>Client Action</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>invalid_ndjson</code></td>
+                        <td>NDJSON parsing failed</td>
+                        <td>Ensure JSON + newline format</td>
+                    </tr>
+                    <tr>
+                        <td><code>handshake_required</code></td>
+                        <td>HANDSHAKE not performed</td>
+                        <td>Send HANDSHAKE first</td>
+                    </tr>
+                    <tr>
+                        <td><code>version_mismatch</code></td>
+                        <td>Protocol major version mismatch</td>
+                        <td>Match server MAJOR version</td>
+                    </tr>
+                    <tr>
+                        <td><code>busy_session_active</code></td>
+                        <td>Session already in use</td>
+                        <td>Send STOP before retry</td>
+                    </tr>
+                    <tr>
+                        <td><code>session_timeout</code></td>
+                        <td>Session idle timeout</td>
+                        <td>Reconnect and HANDSHAKE</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h4>MONITOR Errors</h4>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Error Code</th>
+                        <th>Description</th>
+                        <th>Client Action</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>invalid_method</code></td>
+                        <td>Non-GET method used</td>
+                        <td>Use GET only</td>
+                    </tr>
+                    <tr>
+                        <td><code>invalid_url</code></td>
+                        <td>URL format error</td>
+                        <td>Start with /, no spaces</td>
+                    </tr>
+                    <tr>
+                        <td><code>invalid_period</code></td>
+                        <td>period_ms out of range</td>
+                        <td>Use 2-30000 ms</td>
+                    </tr>
+                    <tr>
+                        <td><code>monitor_already_active</code></td>
+                        <td>MONITOR already running</td>
+                        <td>STOP before new MONITOR</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h4>CONTROL Errors</h4>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Error Code</th>
+                        <th>Description</th>
+                        <th>Client Action</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>control_err</code></td>
+                        <td>CONTROL execution failed</td>
+                        <td>Check status/body in error</td>
+                    </tr>
+                    <tr>
+                        <td><code>invalid_body</code></td>
+                        <td>Body JSON error</td>
+                        <td>Validate body structure</td>
+                    </tr>
+                    <tr>
+                        <td><code>method_not_allowed</code></td>
+                        <td>Method not allowed</td>
+                        <td>Use POST/PUT/DELETE</td>
+                    </tr>
+                </tbody>
+            </table>
+        </section>
+
+        <!-- Example Code Snippets Section -->
+        <section id="examples">
+            <h2>💻 Example Code Snippets</h2>
+
+            <h3>Complete Python Client Example</h3>
+            <pre><code class="language-python">#!/usr/bin/env python3
+"""
+Open Stream Client - Complete Example
+Connects to Hi6 controller and demonstrates all command types
+"""
+
+import json
+import socket
+import threading
+import time
+from typing import Callable, Optional
+
+
+class OpenStreamClient:
+    def __init__(self, host: str = "192.168.0.1", port: int = 49000):
+        self.host = host
+        self.port = port
+        self.sock: Optional[socket.socket] = None
+        self._running = False
+        self._buffer = b""
+        self._rx_thread: Optional[threading.Thread] = None
+        
+        # Event handlers
+        self.on_data: Optional[Callable[[dict], None]] = None
+        self.on_error: Optional[Callable[[dict], None]] = None
+        self.on_ack: Optional[Callable[[dict], None]] = None
+
+    def connect(self) -> None:
+        """Establish TCP connection"""
+        self.sock = socket.create_connection((self.host, self.port))
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        self.sock.settimeout(1.0)
+        self._running = True
+        print(f"[+] Connected to {self.host}:{self.port}")
+
+    def close(self) -> None:
+        """Close connection"""
+        self._running = False
+        if self.sock:
+            self.sock.close()
+        print("[+] Connection closed")
+
+    def _send(self, msg: dict) -> None:
+        """Send NDJSON message"""
+        line = json.dumps(msg, separators=(",", ":"))
+        self.sock.sendall((line + "\n").encode("utf-8"))
+        print(f"[TX] {line}")
+
+    def _recv_loop(self) -> None:
+        """Receive and parse messages"""
+        while self._running:
+            try:
+                chunk = self.sock.recv(4096)
+                if not chunk:
+                    print("[!] Server closed connection")
+                    break
+                    
+                self._buffer += chunk
+                
+                # Parse complete lines
+                while b"\n" in self._buffer:
+                    line, self._buffer = self._buffer.split(b"\n", 1)
+                    if line:
+                        try:
+                            msg = json.loads(line.decode("utf-8"))
+                            self._dispatch(msg)
+                        except json.JSONDecodeError:
+                            print(f"[!] Invalid JSON: {line}")
+                            
+            except socket.timeout:
+                continue
+            except OSError as e:
+                print(f"[!] Socket error: {e}")
+                break
+
+    def _dispatch(self, msg: dict) -> None:
+        """Route messages to appropriate handlers"""
+        if "error" in msg:
+            if self.on_error:
+                self.on_error(msg)
+            else:
+                print(f"[ERROR] {msg}")
+            return
+
+        msg_type = msg.get("type")
+        
+        if msg_type == "data":
+            if self.on_data:
+                self.on_data(msg)
+            else:
+                print(f"[DATA] ts={msg.get('ts')}, dur={msg.get('svc_dur_ms')}ms")
+                
+        elif msg_type in ("handshake_ack", "monitor_ack", "stop_ack"):
+            if self.on_ack:
+                self.on_ack(msg)
+            else:
+                print(f"[ACK] {msg_type}")
+                
+        elif msg_type == "control_err":
+            print(f"[CONTROL ERROR] status={msg.get('status')}")
+        else:
+            print(f"[EVENT] {msg}")
+
+    def start_receive(self) -> None:
+        """Start receive thread"""
+        self._rx_thread = threading.Thread(target=self._recv_loop, daemon=True)
+        self._rx_thread.start()
+
+    # ==================== COMMANDS ====================
+
+    def handshake(self, major: int = 1) -> None:
+        """Perform protocol handshake"""
+        self._send({"cmd": "HANDSHAKE", "payload": {"major": major}})
+
+    def monitor(self, url: str, period_ms: int, args: dict = None) -> None:
+        """Start periodic data streaming"""
+        payload = {
+            "method": "GET",
+            "url": url,
+            "period_ms": max(2, min(30000, period_ms))
+        }
+        if args:
+            payload["args"] = args
+        self._send({"cmd": "MONITOR", "payload": payload})
+
+    def control(self, method: str, url: str, args: dict = None, body: any = None) -> None:
+        """Execute control command (POST/PUT/DELETE)"""
+        payload = {"method": method, "url": url}
+        if args:
+            payload["args"] = args
+        if body is not None:
+            payload["body"] = body
+        self._send({"cmd": "CONTROL", "payload": payload})
+
+    def stop(self, target: str = "session") -> None:
+        """Stop monitor/control/session"""
+        if target not in ("monitor", "control", "session"):
+            raise ValueError("target must be 'monitor', 'control', or 'session'")
+        self._send({"cmd": "STOP", "payload": {"target": target}})
+
+
+# ==================== USAGE EXAMPLE ====================
+
+def main():
+    client = OpenStreamClient(host="192.168.0.1", port=49000)
+    
+    # Set up event handlers
+    def on_data(msg):
+        result = msg.get("result", {})
+        print(f"  Robot state: position={result.get('position', [])}")
+    
+    def on_error(msg):
+        print(f"  ERROR: {msg.get('error')} - {msg.get('message')}")
+    
+    client.on_data = on_data
+    client.on_error = on_error
+
+    try:
+        # 1. Connect
+        client.connect()
+        client.start_receive()
+        time.sleep(0.1)  # Allow thread to start
+
+        # 2. Handshake
+        print("\n[1] HANDSHAKE")
+        client.handshake(major=1)
+        time.sleep(0.1)
+
+        # 3. Start MONITOR
+        print("\n[2] MONITOR - Joint states every 2ms")
+        client.monitor(
+            url="/project/robot/joints/joint_states",
+            period_ms=2,
+            args={"jno_start": 1, "jno_n": 6}
+        )
+        time.sleep(0.1)
+
+        # 4. Receive data for 5 seconds
+        print("\n[3] Receiving data stream (5 seconds)...")
+        for _ in range(50):
+            time.sleep(0.1)
+
+        # 5. Send CONTROL command
+        print("\n[4] CONTROL - Trajectory point")
+        client.control(
+            method="POST",
+            url="/project/robot/trajectory/joint_traject_insert_point",
+            body={
+                "interval": 0.005,
+                "time_from_start": -1,
+                "look_ahead_time": 0.004,
+                "point": [1.0, 90.0, 1.0, 1.0, 1.0, 0.0]
+            }
+        )
+        # Note: No ACK on success, only errors
+
+        time.sleep(0.5)
+
+        # 6. Stop session
+        print("\n[5] STOP session")
+        client.stop(target="session")
+        time.sleep(0.1)
+
+    finally:
+        client.close()
+
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+
+            <h3>Minimal Connection Utility</h3>
+            <pre><code class="language-python"># Minimal NDJSON receiver
+def recv_lines(sock):
+    """Generator that yields complete NDJSON lines"""
+    buf = b""
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk:
+            return
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            if line:
+                yield line.decode("utf-8", errors="replace")
+
+# Usage
+for line in recv_lines(socket):
+    msg = json.loads(line)
+    print(f"Received: {msg}")</code></pre>
+        </section>
+
+        <!-- Performance Notes Section -->
+        <section id="performance">
+            <h2>📊 Performance Notes</h2>
+
+            <h3>Cycle Time Comparison</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Configuration</th>
+                        <th>Average Cycle Time</th>
+                        <th>Jitter</th>
+                        <th>Notes</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><strong>MONITOR Only</strong></td>
+                        <td>~2.0 ms</td>
+                        <td>Low</td>
+                        <td>Predictable streaming, optimal for state monitoring</td>
+                    </tr>
+                    <tr>
+                        <td><strong>MONITOR + CONTROL</strong></td>
+                        <td>~2.1-2.2 ms</td>
+                        <td>Medium</td>
+                        <td>Real-time control with feedback, slight jitter from CONTROL processing</td>
+                    </tr>
+                    <tr>
+                        <td><strong>HTTP OpenAPI (baseline)</strong></td>
+                        <td>>10 ms</td>
+                        <td>High</td>
+                        <td>Connection overhead, not suitable for real-time</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <div class="callout info">
+                <div class="callout-title">📈 Performance Characteristics</div>
+                <ul style="margin-left: 20px; margin-top: 10px;">
+                    <li><strong>MONITOR-only:</strong> Consistent 2ms period with minimal variance</li>
+                    <li><strong>MONITOR+CONTROL:</strong> Slight increase due to CONTROL processing overhead</li>
+                    <li><strong>CONTROL alone:</strong> No periodic overhead, but requires manual polling for state</li>
+                    <li><strong>Network latency:</strong> Negligible on local network (<1ms)</li>
+                </ul>
+            </div>
+
+            <h3>Throughput Considerations</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Factor</th>
+                        <th>Impact</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Message Size</td>
+                        <td>Larger <code>result</code> objects increase processing time slightly</td>
+                    </tr>
+                    <tr>
+                        <td>Period Setting</td>
+                        <td>Minimum 2ms; shorter periods may cause dropped messages</td>
+                    </tr>
+                    <tr>
+                        <td>CONTROL Frequency</td>
+                        <td>High-frequency CONTROL may increase cycle time jitter</td>
+                    </tr>
+                    <tr>
+                        <td>Network Quality</td>
+                        <td>Use wired Ethernet for best results; avoid Wi-Fi for real-time</td>
+                    </tr>
+                </tbody>
+            </table>
+        </section>
+
+        <!-- Best Practices Section -->
+        <section id="best-practices">
+            <h2>⚡ Best Practices & Warnings</h2>
+
+            <div class="callout success">
+                <div class="callout-title">✅ DO - Best Practices</div>
+                <ol style="margin-left: 20px; margin-top: 10px;">
+                    <li><strong>Always HANDSHAKE first</strong> - Send HANDSHAKE immediately after TCP connection</li>
+                    <li><strong>Use one MONITOR + one CONTROL per connection</strong> - New MONITOR replaces existing; one CONTROL session at a time</li>
+                    <li><strong>Keep receiving loop running</strong> - Server pushes data asynchronously; never block the receive thread</li>
+                    <li><strong>Handle errors asynchronously</strong> - Errors arrive as events, not exceptions; process them in your event loop</li>
+                    <li><strong>Use STOP for clean shutdown</strong> - Send <code>STOP(target="session")</code> before closing TCP connection</li>
+                    <li><strong>Implement reconnection logic</strong> - Handle watchdog timeouts and network failures gracefully</li>
+                    <li><strong>Use TCP_NODELAY</strong> - Disable Nagle's algorithm for lowest latency</li>
+                    <li><strong>Buffer incoming data</strong> - TCP doesn't preserve message boundaries; buffer until <code>\n</code></li>
+                </ol>
+            </div>
+
+            <div class="callout error">
+                <div class="callout-title">❌ DON'T - Common Mistakes</div>
+                <ol style="margin-left: 20px; margin-top: 10px;">
+                    <li><strong>Don't assume request-response order</strong> - <code>data</code> events can arrive anytime, not tied to requests</li>
+                    <li><strong>Don't wait for CONTROL ACK</strong> - SUCCESS has no response; only errors generate <code>control_err</code></li>
+                    <li><strong>Don't send multiple MONITORs</strong> - Each new MONITOR replaces the previous one</li>
+                    <li><strong>Don't block the receive thread</strong> - Process messages quickly or use separate threads for heavy computation</li>
+                    <li><strong>Don't ignore watchdog timeout</strong> - 5s timeout when MONITOR active; keep connection alive</li>
+                    <li><strong>Don't use HTTP for real-time</strong> - Open Stream is 5-10x faster than repeated HTTP calls</li>
+                    <li><strong>Don't embed newlines in JSON</strong> - Breaks NDJSON framing; escape all newlines in strings</li>
+                </ol>
+            </div>
+
+            <div class="callout warning">
+                <div class="callout-title">⚠️ WARNING - Critical Notes</div>
+                <ul style="margin-left: 20px; margin-top: 10px;">
+                    <li><strong>CONTROL succeeds silently:</strong> No ACK means you must verify success through MONITOR data or separate status checks</li>
+                    <li><strong>Event order not guaranteed:</strong> <code>handshake_ack</code>, <code>monitor_ack</code>, and first <code>data</code> can arrive in any order</li>
+                    <li><strong>Watchdog is strict:</strong> 5s timeout when MONITOR active means your receive loop MUST not stall</li>
+                    <li><strong>One session = one TCP connection:</strong> Don't multiplex; use separate connections for separate purposes</li>
+                    <li><strong>Version compatibility:</strong> Only MAJOR version matters; MINOR/PATCH changes are backward compatible</li>
+                </ul>
+            </div>
+
+            <h3>Recommended Architecture</h3>
+            <div class="mermaid">
+flowchart TB
+    subgraph "Client Application"
+        A[Main Thread<br/>Business Logic]
+        B[Send Thread<br/>Commands]
+        C[Receive Thread<br/>Event Loop]
+    end
+
+    subgraph "Utilities"
+        D[NDJSON Parser]
+        E[Event Dispatcher]
+        F[Error Handler]
+    end
+
+    subgraph "Network"
+        G[TCP Socket<br/>Port 49000]
+    end
+
+    A -->|Commands| B
+    B -->|send_line| G
+    G -->|recv| C
+    C -->|bytes| D
+    D -->|dict| E
+    E -->|type-based| A
+    E -->|error| F
+
+    style B fill:#e8f4f8
+    style C fill:#e8f4f8
+    style G fill:#fff3e0
+            </div>
+
+            <h3>Error Recovery Pattern</h3>
+            <pre><code class="language-python">def handle_error(error_msg):
+    """Decide recovery strategy based on error type"""
+    code = error_msg.get("error")
+    
+    # Recoverable errors - retry
+    if code in ("session_timeout", "invalid_ndjson"):
+        logger.warning(f"Recoverable error: {code}")
+        # Reconnect strategy
+        client.close()
+        time.sleep(1)
+        client.connect()
+        client.handshake()
+        return True
+    
+    # Fatal errors - need manual intervention
+    elif code in ("version_mismatch", "busy_session_active"):
+        logger.error(f"Fatal error: {code}")
+        # Alert user / stop application
+        return False
+    
+    # Control errors - check status, maybe retry
+    elif code == "control_err":
+        status = error_msg.get("status")
+        if 400 <= status < 500:
+            # Client error - don't retry
+            logger.warning(f"Control failed: {status}")
+        else:
+            # Server error - may retry
+            logger.error(f"Server error: {status}")
+        return True
+    
+    return False</code></pre>
+        </section>
+
+        <!-- Footer -->
+        <section style="text-align: center; color: var(--text-muted); font-size: 0.9em;">
+            <p>HD Hyundai Robotics Open Stream Protocol Guide</p>
+            <p>Based on official documentation for Hi6 Controller</p>
+            <p style="margin-top: 10px;">
+                <em>Generated from official manuals • For production use, always refer to the latest official documentation</em>
+            </p>
+        </section>
+    </div>
+
+    <script>
+        // Initialize Mermaid diagrams
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'default',
+            flowchart: {
+                useMaxWidth: true,
+                htmlLabels: true
+            },
+            sequence: {
+                useMaxWidth: true,
+                wrap: true
+            }
+        });
+
+        // Smooth scrolling for navigation
+        document.querySelectorAll('nav a').forEach(anchor => {
+            anchor.addEventListener('click', function(e) {
+                e.preventDefault();
+                const target = document.querySelector(this.getAttribute('href'));
+                if (target) {
+                    target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }
+            });
+        });
+    </script>
+</body>
+</html>

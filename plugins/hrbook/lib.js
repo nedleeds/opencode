@@ -430,28 +430,203 @@ export function invalidate(book, ver) {
   sectionCache.delete(`${book}@${ver}`);
 }
 
-function scoreLine(line, terms) {
-  const lowered = line.toLowerCase();
-  let hit = 0;
-  for (const t of terms) if (lowered.includes(t)) hit++;
-  return hit;
+/**
+ * Words that signal the user wants to know *which manual* covers something,
+ * rather than what it says — "joint 관련 API 매뉴얼 찾아줘". Full-text search
+ * answers that badly: it returns page fragments when the useful answer is a
+ * list of manual ids.
+ *
+ * Detected here rather than instructed in the agent prompt, because a rule the
+ * model has to remember is a rule it sometimes forgets, and these words are
+ * already being parsed out of the query as stopwords.
+ */
+const CATALOGUE_SIGNALS = ['매뉴얼', '메뉴얼', '설명서', 'manual', 'manuals'];
+
+export function looksLikeCatalogueQuery(query) {
+  const lowered = String(query).toLowerCase();
+  if (!CATALOGUE_SIGNALS.some((w) => lowered.includes(w))) return false;
+  // "매뉴얼에서 조그 속도 찾아줘" names the source but still asks for content;
+  // an interrogative is what marks it as a question about the catalogue.
+  return /찾|어떤|어느|있|목록|list|which|what/.test(lowered);
 }
 
 /**
- * Full-text search across the local indexes.
+ * Words that appear on nearly every page and therefore carry no signal.
  *
- * Scoring is deliberately plain: a line is worth the number of distinct query
- * terms it contains, and a section takes its best line. Nothing here needs to
- * be clever, because the model receives the surrounding page and decides for
- * itself — the job is to narrow ~8 MB down to a handful of addressable pages.
+ * The model writes the query, and asked "joint 관련 API 매뉴얼 찾아줘" it
+ * frequently passes the sentence through rather than the two nouns that
+ * matter. Left in, "관련" and "매뉴얼" mean no page covers every term, the
+ * search falls back to partial matching, and pages whose only qualification is
+ * the word "매뉴얼" flood the result. Stripping them in code is reliable in a
+ * way that instructing the model is not.
+ */
+const STOPWORDS = new Set([
+  '관련', '관련된', '매뉴얼', '메뉴얼', '설명서', '문서', '내용', '방법', '사용', '사용법',
+  '설명', '정보', '자료', '부분', '경우', '대해', '대한', '위한', '찾아줘', '알려줘',
+  '보여줘', '가르쳐줘', '어떻게', '무엇', '뭐야', '뭔지', '어디', '있나', '있어',
+  'manual', 'document', 'about', 'related', 'find', 'show', 'tell', 'what', 'where',
+  'how', 'the', 'and', 'for', 'with',
+]);
+
+/**
+ * Korean particles, stripped from the tail of a token.
+ *
+ * Matching is substring-based, so a query term shorter than the text still
+ * hits — "민첩" finds "민첩하게". The reverse is what breaks: "튜닝을" never
+ * finds "튜닝". Longest-first, or "으로" would be cut to "으" by the "로" rule.
+ */
+const PARTICLES = [
+  '에서는', '에서의', '으로는', '이라는', '에서', '에게', '으로', '까지', '부터', '보다',
+  '이나', '라는', '으론', '한테', '들의', '들을', '들이',
+  '은', '는', '이', '가', '을', '를', '의', '에', '와', '과', '도', '만', '로', '랑',
+];
+
+function stripParticle(token) {
+  for (const p of PARTICLES) {
+    if (token.length > p.length + 1 && token.endsWith(p)) return token.slice(0, -p.length);
+  }
+  return token;
+}
+
+/**
+ * Turn whatever the model sent into terms worth matching.
+ *
+ * Each term keeps both its original form and its particle-stripped stem: a
+ * page containing either counts, so "튜닝을" and "튜닝" behave the same. If
+ * filtering would leave nothing — a query made entirely of stopwords — the raw
+ * tokens are used instead, because a bad search beats no search.
+ */
+export function extractTerms(query) {
+  const raw = String(query)
+    .toLowerCase()
+    .split(/[\s/,.·:;()[\]"']+/)
+    .filter(Boolean);
+
+  const terms = [];
+  const seen = new Set();
+  for (const token of raw) {
+    if (STOPWORDS.has(token)) continue;
+    const stem = stripParticle(token);
+    if (stem.length < 2) continue;
+    if (STOPWORDS.has(stem)) continue;
+    if (seen.has(stem)) continue;
+    seen.add(stem);
+    // Both forms, so "튜닝을" matches a page that only ever writes "튜닝".
+    terms.push({ text: stem, forms: stem === token ? [stem] : [stem, token] });
+  }
+
+  if (terms.length === 0) {
+    return raw.filter((t) => t.length > 1).map((t) => ({ text: t, forms: [t] }));
+  }
+  return terms;
+}
+
+/** Korean compounds are written both ways — "민첩 모드" and "민첩모드" — and
+ *  which one appears is not consistent across manuals. */
+const despace = (s) => s.replace(/\s+/g, '');
+
+function scoreLine(line, terms) {
+  const lowered = line.toLowerCase();
+  const packed = despace(lowered);
+  let score = 0;
+  for (const t of terms) {
+    if (t.forms.some((f) => lowered.includes(f))) score += 2;
+    // Half credit: dropping spaces also joins words that were never one, so a
+    // page that spells the compound the same way as the query still wins.
+    else if (t.forms.some((f) => packed.includes(despace(f)))) score += 1;
+  }
+  return score;
+}
+
+function matchedTerms(line, terms) {
+  const lowered = line.toLowerCase();
+  const packed = despace(lowered);
+  const out = [];
+  for (const t of terms) {
+    if (t.forms.some((f) => lowered.includes(f) || packed.includes(despace(f)))) out.push(t.text);
+  }
+  return out;
+}
+
+/**
+ * The heading directly above a hit, not the first heading on the page.
+ *
+ * Manual pages are long and carry many sections: a page whose first heading is
+ * "제어 파라미터 설정" may hold "[민첩 모드]" three hundred lines down. Reporting
+ * the page's opening heading hides exactly the thing the query matched, and
+ * the model — seeing a title with no apparent relation to the question —
+ * concludes the manual does not cover it and moves on.
+ */
+function headingAbove(lines, at) {
+  for (let i = at; i >= 0; i--) {
+    if (/^#{1,6}\s+/.test(lines[i])) {
+      return lines[i]
+        .replace(/^#{1,6}\s+/, '')
+        .replace(/[*_`]/g, '')
+        .trim();
+    }
+  }
+  return '';
+}
+
+/** `grep -C`: the hit alone is rarely enough to judge a page by. */
+function contextAround(lines, at, radius = 3) {
+  const out = [];
+  for (let i = Math.max(0, at - radius); i <= Math.min(lines.length - 1, at + radius); i++) {
+    const t = lines[i].trim();
+    if (t) out.push(t);
+  }
+  return out.join(' ⏎ ').slice(0, 400);
+}
+
+/**
+ * Full-text search across the local manuals, grouped by manual and tiered.
+ *
+ * Three decisions shape this, each from a way the earlier versions failed:
+ *
+ * 1. **Grouped by manual, with per-manual quotas.** A flat list capped at N
+ *    pages lets one verbose manual take every slot — the Open API manual
+ *    mentions "모드" everywhere, so the single force-control page holding
+ *    "민첩 모드" never appeared and the agent declared the topic absent.
+ *
+ * 2. **Tiered, not filtered.** Dropping partial matches whenever a complete
+ *    one existed answered the wrong question. Someone asking about 부가축 튜닝
+ *    wants the 부가축 manual's procedure *and* the force-control manual's gain
+ *    parameters; discarding the second because the first matched every term
+ *    hides exactly the cross-manual context they were after. Partial matches
+ *    are demoted to a second tier and labelled with what they matched.
+ *
+ * 3. **Weighted coverage, not term count.** Requiring every term punished
+ *    detailed queries: five good keywords rarely co-occur on one page, so the
+ *    search fell back to noise. Terms are weighted by how rare they are across
+ *    the corpus, so missing a common word costs almost nothing while missing a
+ *    rare one is decisive — and adding keywords now helps rather than hurts.
  */
 export async function search(query, opts = {}) {
-  const { lang, book, limit = 8 } = opts;
-  const terms = query.toLowerCase().split(/[\s/]+/).filter(Boolean);
-  if (terms.length === 0) return { hits: [], total: 0, scanned: 0 };
+  const {
+    lang,
+    book,
+    books,
+    perBook = 3,
+    perPartialBook = 2,
+    maxBooks = 8,
+    directThreshold = 0.7,
+    limit,
+  } = opts;
 
-  const targets = (await listIndexes(lang)).filter((t) => !book || t.book === book);
-  const hits = [];
+  const terms = extractTerms(query);
+  const empty = { groups: [], bookCount: 0, total: 0, scanned: 0, terms: [], partial: false };
+  if (terms.length === 0) return empty;
+
+  const allowed = books?.length ? new Set(books) : null;
+  const targets = (await listIndexes(lang)).filter(
+    (t) => (!book || t.book === book) && (!allowed || allowed.has(t.book)),
+  );
+
+  // --- pass 1: find matches and count how many pages each term appears on ---
+
+  const matches = [];
+  const df = new Map(terms.map((t) => [t.text, 0]));
   let scanned = 0;
 
   for (const t of targets) {
@@ -460,35 +635,159 @@ export async function search(query, opts = {}) {
     scanned += sections.length;
 
     for (const s of sections) {
-      let best = 0;
-      let bestLine = '';
-      for (const line of s.lines) {
+      const covered = new Set();
+      let bestLine = -1;
+      let bestScore = 0;
+      let hitCount = 0;
+
+      for (let i = 0; i < s.lines.length; i++) {
+        const line = s.lines[i];
         if (!line.trim()) continue;
         const score = scoreLine(line, terms);
-        if (score > best) {
-          best = score;
-          bestLine = line.trim();
+        if (score === 0) continue;
+        hitCount++;
+        for (const term of matchedTerms(line, terms)) covered.add(term);
+        // Ties keep the first occurrence, usually the section heading.
+        if (score > bestScore) {
+          bestScore = score;
+          bestLine = i;
         }
-        if (best === terms.length) break;
       }
-      // A heading match counts even when no body line does — section titles
-      // are short and carry the topic.
-      const headScore = scoreLine(`${s.heading} ${s.path}`, terms);
-      const score = Math.max(best, headScore);
-      if (score === 0) continue;
-      hits.push({
+
+      const title = `${s.heading} ${s.path}`;
+      const titleScore = scoreLine(title, terms);
+      for (const term of matchedTerms(title, terms)) covered.add(term);
+      if (covered.size === 0) continue;
+
+      for (const term of covered) df.set(term, (df.get(term) ?? 0) + 1);
+      matches.push({
         book: t.book,
         ver: t.ver,
         path: s.path,
+        lines: s.lines,
         heading: s.heading,
-        score,
-        snippet: (bestLine || s.heading).slice(0, 220),
+        covered,
+        hitCount,
+        bestLine,
+        bestScore,
+        titleScore,
       });
     }
   }
 
-  hits.sort((a, b) => b.score - a.score);
-  return { hits: hits.slice(0, limit), total: hits.length, scanned };
+  if (matches.length === 0) {
+    return { ...empty, scanned, terms: terms.map((t) => ({ term: t.text, pages: 0, idf: 0 })) };
+  }
+
+  // --- pass 2: weight terms by rarity, then score ---
+
+  /**
+   * Inverse document frequency. A term on 30 pages out of 4000 identifies a
+   * topic; a term on 2000 pages identifies nothing. This is what lets a user
+   * pile on keywords safely — the common ones simply weigh little.
+   *
+   * A term matching zero pages keeps a nonzero weight so it still counts
+   * against coverage: a query naming something absent from the manuals should
+   * not score as though it had been satisfied.
+   */
+  const idf = new Map();
+  for (const t of terms) {
+    const pages = df.get(t.text) ?? 0;
+    idf.set(t.text, Math.log(1 + scanned / (1 + pages)));
+  }
+  const totalWeight = terms.reduce((n, t) => n + idf.get(t.text), 0) || 1;
+
+  // The most informative term in the query. A page matching only common words
+  // is noise — "설정" alone would drag in half the corpus — so a page must
+  // carry something at least moderately distinctive to appear at all.
+  const maxIdf = Math.max(...terms.map((t) => idf.get(t.text)));
+  const informativeFloor = maxIdf * 0.4;
+  const anyInformative = terms.some((t) => idf.get(t.text) >= informativeFloor);
+
+  const scored = [];
+  for (const m of matches) {
+    const weight = [...m.covered].reduce((n, term) => n + (idf.get(term) ?? 0), 0);
+    const ratio = weight / totalWeight;
+    const carriesInformative = [...m.covered].some((term) => idf.get(term) >= informativeFloor);
+    if (anyInformative && !carriesInformative) continue;
+
+    const heading = m.bestLine >= 0 ? headingAbove(m.lines, m.bestLine) || m.heading : m.heading;
+    scored.push({
+      book: m.book,
+      ver: m.ver,
+      path: m.path,
+      heading,
+      matched: [...m.covered],
+      coverage: Number(ratio.toFixed(3)),
+      tier: ratio >= directThreshold ? 'direct' : 'partial',
+      // Weighted coverage dominates; line clustering and a title match only
+      // break ties inside the same band.
+      score: Math.round(ratio * 10000 + m.bestScore * 50 + m.titleScore * 25 + Math.min(m.hitCount, 10)),
+      hits: m.hitCount,
+      snippet:
+        m.bestLine >= 0 ? contextAround(m.lines, m.bestLine) : `${m.heading} (${m.path})`,
+    });
+  }
+
+  if (scored.length === 0) {
+    return {
+      ...empty,
+      scanned,
+      terms: terms.map((t) => ({ term: t.text, pages: df.get(t.text) ?? 0, idf: idf.get(t.text) })),
+    };
+  }
+
+  // --- group by manual, order by tier then strength ---
+
+  const byBook = new Map();
+  for (const p of scored) {
+    const key = `${p.book}@${p.ver}`;
+    if (!byBook.has(key)) {
+      byBook.set(key, { book: p.book, ver: p.ver, pages: [], hits: 0, best: 0, matched: new Set() });
+    }
+    const g = byBook.get(key);
+    g.pages.push(p);
+    g.hits += p.hits;
+    g.best = Math.max(g.best, p.score);
+    for (const term of p.matched) g.matched.add(term);
+  }
+
+  const groups = [...byBook.values()].map((g) => {
+    g.pages.sort((a, b) => b.score - a.score);
+    g.pageTotal = g.pages.length;
+    g.tier = g.pages[0].tier;
+    g.matched = [...g.matched];
+    return g;
+  });
+
+  // Manuals that cover the question come first; the rest follow as context
+  // rather than being thrown away.
+  groups.sort((a, b) => {
+    if (a.tier !== b.tier) return a.tier === 'direct' ? -1 : 1;
+    return b.best - a.best || b.hits - a.hits;
+  });
+
+  const kept = groups.slice(0, maxBooks);
+  let budget = limit ?? Infinity;
+  for (const g of kept) {
+    const quota = Math.min(g.tier === 'direct' ? perBook : perPartialBook, budget);
+    g.pages = g.pages.slice(0, Math.max(0, quota));
+    budget -= g.pages.length;
+  }
+
+  return {
+    groups: kept,
+    bookCount: groups.length,
+    directCount: groups.filter((g) => g.tier === 'direct').length,
+    total: scored.length,
+    scanned,
+    partial: !groups.some((g) => g.tier === 'direct'),
+    terms: terms.map((t) => ({
+      term: t.text,
+      pages: df.get(t.text) ?? 0,
+      idf: Number((idf.get(t.text) ?? 0).toFixed(2)),
+    })),
+  };
 }
 
 // ---------------------------------------------------------------- page reads
@@ -513,6 +812,16 @@ export function absolutiseLinks(text, book, ver, srcPath) {
   });
 }
 
+/**
+ * GitBook hint blocks carry the safety warnings. A model summarising a
+ * procedure will drop them as boilerplate unless something insists, and on a
+ * robot controller that omission is the dangerous kind — so their presence is
+ * flagged out of band rather than left to be noticed in the prose.
+ */
+export function hasWarning(text) {
+  return /\{%\s*hint\s+style=["'](?:danger|warning|caution)["']/i.test(text);
+}
+
 export async function readPage(book, ver, relPath, maxBytes = 12000, variables) {
   const sections = await loadSections(book, ver);
   if (!sections) throw new Error(`index not available: ${book}/${ver}`);
@@ -529,6 +838,7 @@ export async function readPage(book, ver, relPath, maxBytes = 12000, variables) 
   return {
     text: truncated ? text.slice(0, maxBytes) : text,
     truncated,
+    warning: hasWarning(text),
     url: viewerUrl(book, ver, section.path, variables?.cont_model),
   };
 }

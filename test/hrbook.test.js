@@ -190,24 +190,22 @@ test('full-text search finds body text that matches no title and no alias', asyn
     // The query that returned nothing under catalogue keyword scoring: no
     // manual is titled "초기 설정" and no topic alias covers it.
     const r = await search('초기 설정', { lang: 'ko' });
-    assert.equal(r.hits[0].path, '0-about-this-manual/precautions.md');
-    assert.match(r.hits[0].snippet, /안전 회로/);
-    // A page matching only "설정" still surfaces, but below the one matching
-    // both terms — partial matches are worth ranking, not discarding.
-    assert.equal(r.hits[1].path, '3-setup/network/config.md');
-    assert.ok(r.hits[0].score > r.hits[1].score);
+    assert.equal(r.groups[0].pages[0].path, '0-about-this-manual/precautions.md');
+    assert.match(r.groups[0].pages[0].snippet, /안전 회로/);
+    assert.equal(r.groups[0].pages[0].tier, 'direct');
+    assert.equal(r.partial, false);
   });
 });
 
 test('search scopes to a language and to a single book', async () => {
   await withIndex(async ({ search }) => {
-    assert.equal((await search('조그 속도', { lang: 'en' })).hits.length, 0, 'wrong language');
+    assert.equal((await search('조그 속도', { lang: 'en' })).total, 0, 'wrong language');
     assert.equal(
-      (await search('조그 속도', { book: 'doc-hi6-open-api' })).hits.length,
+      (await search('조그 속도', { book: 'doc-hi6-open-api' })).total,
       0,
       'wrong book',
     );
-    assert.equal((await search('조그 속도', { lang: 'ko' })).hits.length, 1);
+    assert.equal((await search('조그 속도', { lang: 'ko' })).total, 1);
   });
 });
 
@@ -275,5 +273,286 @@ test('booksForLang keeps one branch per language, not one per controller', async
     assert.equal(ids.filter((i) => i.startsWith('doc-industrial-communication')).length, 1);
     // The external-PDF entry has no repository to fetch from.
     assert.ok(!ids.some((i) => i.startsWith('doc-hi6-maintenance')));
+  });
+});
+
+/**
+ * The failure this pins: asked about "민첩 모드", the agent insisted the force
+ * control manual had no such thing. The page did contain it — but ranking was
+ * per-line, so dozens of Open API pages holding only "모드" tied with the one
+ * page holding both terms, and the tie broke on filesystem order.
+ */
+const LONG_PAGE = [
+  '[__SOURCE](api/mode.md)',
+  '# Open API 모드 전환',
+  '모드 파라미터를 전달합니다.',
+  '',
+  '[__SOURCE](api/status.md)',
+  '# 상태 조회',
+  '현재 모드를 반환합니다.',
+  '',
+  '[__SOURCE](3-params/control.md)',
+  '# 제어 파라미터 설정',
+  '응답 설정값이 낮을수록 민첩하게 도달합니다.',
+  '',
+  '##### **[민첩 모드]**',
+  '민첩 모드는 추종 성능을 극대화합니다.',
+  '설정 범위는 0~100 입니다.',
+].join('\n');
+
+async function withLongPage(fn) {
+  const cache = await mkdtemp(path.join(tmpdir(), 'hrbook-test-'));
+  try {
+    process.env.HRBOOK_CACHE = cache;
+    const lib = await import(`../plugins/hrbook/lib.js?long=${encodeURIComponent(cache)}`);
+    await mkdir(lib.INDEX_DIR, { recursive: true });
+    await writeFile(lib.indexPath('doc-hi6-force-control', 'ko'), LONG_PAGE, 'utf8');
+    await fn(lib);
+  } finally {
+    delete process.env.HRBOOK_CACHE;
+    await rm(cache, { recursive: true, force: true });
+  }
+}
+
+test('a page carrying every term outranks pages carrying only one', async () => {
+  await withLongPage(async ({ search }) => {
+    const r = await search('민첩 모드', { lang: 'ko' });
+    const [top] = r.groups[0].pages;
+    assert.equal(top.path, '3-params/control.md');
+    assert.equal(top.tier, 'direct');
+    // The "모드"-only pages survive as context but are demoted, never mixed in
+    // above the page that answers the question.
+    const others = r.groups[0].pages.slice(1);
+    assert.ok(others.every((p) => p.tier === 'partial'));
+    assert.equal(r.partial, false);
+  });
+});
+
+test('a hit reports the heading directly above it, not the page title', async () => {
+  await withLongPage(async ({ search }) => {
+    const [hit] = (await search('민첩 모드', { lang: 'ko' })).groups[0].pages;
+    // "제어 파라미터 설정" is the page's opening heading and says nothing about
+    // the query; reporting it is what made the result look irrelevant.
+    assert.equal(hit.heading, '[민첩 모드]');
+    assert.ok(hit.hits > 1, 'multiple matches on the page are counted');
+  });
+});
+
+test('a snippet carries the lines around the hit, not the hit alone', async () => {
+  await withLongPage(async ({ search }) => {
+    const [hit] = (await search('민첩 모드', { lang: 'ko' })).groups[0].pages;
+    assert.match(hit.snippet, /추종 성능/);
+    assert.match(hit.snippet, /설정 범위/);
+  });
+});
+
+test('a query no page fully covers falls back to partial matches, and says so', async () => {
+  await withLongPage(async ({ search }) => {
+    const r = await search('민첩 존재하지않는단어', { lang: 'ko' });
+    assert.equal(r.partial, true, 'flagged so the model does not over-trust it');
+    assert.ok(r.total > 0, 'still better than nothing');
+  });
+});
+
+test('search can be restricted to an explicit set of books', async () => {
+  await withLongPage(async ({ search }) => {
+    // How the `product` filter reaches search: book ids are resolved from
+    // bookinfos, because the files on disk carry no product metadata.
+    assert.equal((await search('민첩 모드', { books: ['doc-hrscript'] })).bookCount, 0);
+    const only = await search('민첩 모드', { books: ['doc-hi6-force-control'] });
+    assert.equal(only.bookCount, 1);
+    assert.equal(only.groups[0].book, 'doc-hi6-force-control');
+  });
+});
+
+/**
+ * Grouping by manual, not one flat ranked list.
+ *
+ * A flat list capped at N pages lets a verbose manual take every slot: the
+ * Open API manual mentions "모드" everywhere, so the single force-control page
+ * holding "민첩 모드" never surfaced at all. Per-manual quotas make a manual
+ * that contains the term visible however loud its neighbours are.
+ */
+const NOISY = [
+  ...Array.from({ length: 12 }, (_, i) =>
+    [`[__SOURCE](api/p${i}.md)`, `# 모드 항목 ${i}`, '모드 파라미터를 전달합니다.', ''].join('\n'),
+  ),
+].join('\n');
+
+const QUIET = [
+  '[__SOURCE](3-params/control.md)',
+  '# 제어 파라미터 설정',
+  '##### **[민첩 모드]**',
+  '민첩 모드는 추종 성능을 극대화합니다.',
+].join('\n');
+
+async function withTwoBooks(fn) {
+  const cache = await mkdtemp(path.join(tmpdir(), 'hrbook-test-'));
+  try {
+    process.env.HRBOOK_CACHE = cache;
+    const lib = await import(`../plugins/hrbook/lib.js?two=${encodeURIComponent(cache)}`);
+    await mkdir(lib.INDEX_DIR, { recursive: true });
+    await writeFile(lib.indexPath('doc-hi6-open-api', 'ko'), NOISY, 'utf8');
+    await writeFile(lib.indexPath('doc-hi6-force-control', 'ko'), QUIET, 'utf8');
+    await fn(lib);
+  } finally {
+    delete process.env.HRBOOK_CACHE;
+    await rm(cache, { recursive: true, force: true });
+  }
+}
+
+test('results are grouped per manual, with each manual counted separately', async () => {
+  await withTwoBooks(async ({ search }) => {
+    const r = await search('모드', { lang: 'ko' });
+    assert.equal(r.bookCount, 2, 'both manuals reported, not just the loud one');
+    const quiet = r.groups.find((g) => g.book === 'doc-hi6-force-control');
+    assert.ok(quiet, 'the quiet manual is never crowded out');
+    // Twelve pages exist in the noisy manual but only the quota is returned;
+    // the true count still travels so the model knows the shape.
+    const noisy = r.groups.find((g) => g.book === 'doc-hi6-open-api');
+    assert.equal(noisy.pageTotal, 12);
+    assert.equal(noisy.pages.length, 3, 'per-manual quota applied');
+  });
+});
+
+test('a manual matching only a corpus-wide common word is treated as noise', async () => {
+  await withTwoBooks(async ({ search }) => {
+    const r = await search('민첩 모드', { lang: 'ko' });
+    assert.equal(r.groups[0].book, 'doc-hi6-force-control');
+    assert.equal(r.groups[0].tier, 'direct');
+    // Here "모드" is on every page in the fixture, so it identifies nothing and
+    // the pages carrying only it are dropped. This is rarity-relative, not a
+    // fixed rule: where "모드" is uncommon those same pages would survive as
+    // partial matches, which is what the LONG_PAGE case above checks.
+    assert.equal(r.bookCount, 1);
+    const rare = r.terms.find((t) => t.term === '민첩');
+    const common = r.terms.find((t) => t.term === '모드');
+    assert.ok(rare.idf > common.idf, 'the rarer term carries more weight');
+  });
+});
+
+/**
+ * The model writes the query, so the code cannot assume clean keywords. These
+ * pin the normalisation that makes a sentence behave like the two nouns in it.
+ */
+test('extractTerms drops the words that appear on every page', async () => {
+  const { extractTerms } = await import('../plugins/hrbook/lib.js');
+  // "joint 관련 API 매뉴얼 찾아줘" — with 관련/매뉴얼/찾아줘 left in, no page
+  // covers every term, the search degrades to partial matching, and pages
+  // whose only qualification is the word "매뉴얼" flood the result.
+  assert.deepEqual(
+    extractTerms('joint 관련 API 매뉴얼 찾아줘').map((t) => t.text),
+    ['joint', 'api'],
+  );
+});
+
+test('extractTerms strips particles but keeps the original form too', async () => {
+  const { extractTerms } = await import('../plugins/hrbook/lib.js');
+  const [term] = extractTerms('튜닝을');
+  assert.equal(term.text, '튜닝');
+  assert.deepEqual(term.forms, ['튜닝', '튜닝을']);
+  // Longest-first, or "으로" would be cut to "으" by the "로" rule.
+  assert.equal(extractTerms('제어으로')[0].text, '제어');
+});
+
+test('extractTerms falls back to raw tokens rather than returning nothing', async () => {
+  const { extractTerms } = await import('../plugins/hrbook/lib.js');
+  // A query made entirely of stopwords still has to search something: a bad
+  // search beats reporting "no results" for a question the manuals cover.
+  assert.deepEqual(extractTerms('방법 알려줘').map((t) => t.text), ['방법', '알려줘']);
+});
+
+test('a compound written without spaces still matches the spaced text', async () => {
+  await withLongPage(async ({ search }) => {
+    // The manuals are not consistent about "민첩 모드" vs "민첩모드", and the
+    // user is not going to guess which one a given page used.
+    const r = await search('민첩모드', { lang: 'ko' });
+    assert.equal(r.groups[0].pages[0].path, '3-params/control.md');
+  });
+});
+
+test('a partial result reports which terms failed and which worked', async () => {
+  await withLongPage(async ({ search }) => {
+    const r = await search('민첩 존재하지않는단어', { lang: 'ko' });
+    assert.equal(r.partial, true);
+    const dead = r.terms.find((t) => t.term === '존재하지않는단어');
+    const live = r.terms.find((t) => t.term === '민첩');
+    assert.equal(dead.pages, 0, 'a term matching nothing is reported as such');
+    assert.ok(live.pages > 0, 'so the model can retry with the term that worked');
+  });
+});
+
+test('a question about which manual exists is routed to the catalogue', async () => {
+  const { looksLikeCatalogueQuery } = await import('../plugins/hrbook/lib.js');
+  // Detected in code rather than instructed in the prompt: a rule the model
+  // has to remember is a rule it sometimes forgets.
+  assert.equal(looksLikeCatalogueQuery('joint 관련 API 매뉴얼 찾아줘'), true);
+  assert.equal(looksLikeCatalogueQuery('어떤 설명서가 있어?'), true);
+  // Naming the source is not the same as asking about it — this one still
+  // wants page content and must go to full-text search.
+  assert.equal(looksLikeCatalogueQuery('조그 속도 기본값'), false);
+});
+
+test('safety hint blocks are flagged so a summary cannot quietly drop them', async () => {
+  const { hasWarning } = await import('../plugins/hrbook/lib.js');
+  assert.equal(hasWarning('{% hint style="danger" %}\n감전 위험\n{% endhint %}'), true);
+  assert.equal(hasWarning('{% hint style="info" %}\n참고\n{% endhint %}'), false);
+});
+
+/**
+ * Adding good keywords must help, not hurt. Requiring every term punished the
+ * detailed query — five sound keywords rarely co-occur on one page, so the
+ * search fell back to noise and the user learned to ask for less.
+ */
+const CORPUS = [
+  '[__SOURCE](tune/gain.md)',
+  '# 부가축 서보 튜닝',
+  '부가축 서보 이득 파라미터를 설정합니다.',
+  '',
+  '[__SOURCE](general/setup.md)',
+  '# 일반 설정',
+  '설정 화면에서 파라미터를 확인합니다.',
+  '',
+  '[__SOURCE](general/misc.md)',
+  '# 기타',
+  '파라미터 설정은 관리자만 가능합니다.',
+].join('\n');
+
+async function withCorpus(fn) {
+  const cache = await mkdtemp(path.join(tmpdir(), 'hrbook-test-'));
+  try {
+    process.env.HRBOOK_CACHE = cache;
+    const lib = await import(`../plugins/hrbook/lib.js?corpus=${encodeURIComponent(cache)}`);
+    await mkdir(lib.INDEX_DIR, { recursive: true });
+    await writeFile(lib.indexPath('doc-add-axes', 'ko'), CORPUS, 'utf8');
+    await fn(lib);
+  } finally {
+    delete process.env.HRBOOK_CACHE;
+    await rm(cache, { recursive: true, force: true });
+  }
+}
+
+test('a page missing only common terms still counts as directly relevant', async () => {
+  await withCorpus(async ({ search }) => {
+    // Five terms, and no page carries all five — "튜닝" and "이득" never share
+    // a line with "설정". Under the old all-or-nothing rule this collapsed to
+    // partial matching and the right page was buried.
+    const r = await search('부가축 서보 튜닝 이득 파라미터 설정', { lang: 'ko' });
+    assert.equal(r.groups[0].pages[0].path, 'tune/gain.md');
+    assert.equal(r.groups[0].pages[0].tier, 'direct');
+    assert.equal(r.partial, false);
+  });
+});
+
+test('rarity decides the weighting, so common words cannot outvote rare ones', async () => {
+  await withCorpus(async ({ search }) => {
+    const r = await search('부가축 설정', { lang: 'ko' });
+    const rare = r.terms.find((t) => t.term === '부가축');
+    const common = r.terms.find((t) => t.term === '설정');
+    assert.equal(rare.pages, 1);
+    assert.ok(common.pages > rare.pages);
+    assert.ok(rare.idf > common.idf);
+    // The page with the rare term wins even though two pages match "설정".
+    assert.equal(r.groups[0].pages[0].path, 'tune/gain.md');
   });
 });

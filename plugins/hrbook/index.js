@@ -12,8 +12,10 @@ import {
   fetchIndexSet,
   indexAbsent,
   hasIndex,
+  hasWarning,
   legacyCloneSize,
   listIndexes,
+  looksLikeCatalogueQuery,
   loadBookinfos,
   pendingFor,
   rankBooks,
@@ -76,8 +78,23 @@ export const HrBookPlugin = async ({ client }) => {
       await client.tui.showToast({ body: { message, variant } });
       toastFailures = 0;
       return true;
-    } catch {
+    } catch (err) {
       toastFailures++;
+      // Logged, because a toast that never arrives is invisible by
+      // definition: without this the only symptom is a silent screen, and
+      // there is nothing to tell "the notice was never sent" apart from "the
+      // notice was sent and the TUI dropped it".
+      try {
+        await client.app.log({
+          body: {
+            service: 'hrbook',
+            level: 'warn',
+            message: `toast failed (${toastFailures}): ${String(err?.message ?? err).slice(0, 80)}`,
+          },
+        });
+      } catch {
+        // Nothing left to report to.
+      }
       return false;
     }
   };
@@ -127,6 +144,23 @@ export const HrBookPlugin = async ({ client }) => {
     if (state.ready) return { built: false };
     if (state.building) return { built: false, busy: true };
 
+    // Announced before `loadBookinfos()`, not after.
+    //
+    // A cache miss is detectable from a directory listing alone, and the very
+    // first thing that follows is a network fetch of bookinfos.json — so
+    // waiting until the manual count is known puts the notice behind a round
+    // trip on exactly the run where the user is staring at an empty screen
+    // wondering whether anything is happening. The count arrives in the
+    // completion toast instead.
+    const already = await listIndexes(PRIMARY_LANG);
+    if (already.length === 0) {
+      const delivered = await toast(
+        `캐시된 매뉴얼이 없습니다. 매뉴얼을 내려받습니다 — ${CACHE}`,
+        'loading',
+      );
+      if (!delivered) await log('cache-miss toast could not be delivered', 'warn');
+    }
+
     const infos = await loadBookinfos();
     const entries = booksForLang(infos, PRIMARY_LANG);
     const pending = pendingFor(entries);
@@ -137,10 +171,15 @@ export const HrBookPlugin = async ({ client }) => {
     }
 
     state.building = true;
-    await toast(
-      `매뉴얼 내려받는 중 — ${PRIMARY_LANG} ${pending.length}권 (${CACHE})`,
-      'loading',
-    );
+    if (already.length > 0) {
+      // Only reachable when the set is partly present — a previous run was
+      // interrupted. The full-miss case has already been announced above and
+      // does not need saying twice.
+      await toast(
+        `매뉴얼 내려받는 중 — ${PRIMARY_LANG} ${pending.length}권 (${CACHE})`,
+        'loading',
+      );
+    }
     try {
       const { ok, absent, failed } = await fetchIndexSet(pending);
       state.counts.primary = entries.filter((e) => hasIndex(e.book, e.ver)).length;
@@ -242,13 +281,66 @@ export const HrBookPlugin = async ({ client }) => {
     }
   }
 
-  const formatHits = (hits, total) =>
-    hits
+  /**
+   * Grouped by manual and split into tiers.
+   *
+   * A flat ranked list hides the shape of the result: the model cannot tell
+   * whether one manual owns the topic or five mention it in passing. The
+   * second tier is kept rather than filtered because a question about 부가축
+   * 튜닝 is also, usually, a question about what the force-control manual says
+   * on gains — but it is labelled with what it actually matched so the model
+   * can weigh it instead of treating it as an equal answer.
+   */
+  const renderGroup = (g) => {
+    const shown = g.pages.length;
+    const more = g.pageTotal > shown ? `, 상위 ${shown}개만 표시` : '';
+    const matched = g.matched?.length ? ` [일치: ${g.matched.join(', ')}]` : '';
+    const pages = g.pages
       .map(
         (h) =>
-          `- book_id=${h.book} ver_id=${h.ver} path=${h.path}\n  ${h.heading || '(제목 없음)'}\n  ${h.snippet}`,
+          `  - path=${h.path}\n` +
+          `    \u00a7${h.heading || '(제목 없음)'}${h.hits > 1 ? ` — 이 페이지에 ${h.hits}곳` : ''}\n` +
+          `    ${h.snippet}`,
       )
-      .join('\n') + (total > hits.length ? `\n(${total - hits.length} more)` : '');
+      .join('\n');
+    return `[${g.book}] ver_id=${g.ver} — ${g.pageTotal}개 페이지 / ${g.hits}곳${more}${matched}\n${pages}`;
+  };
+
+  const formatGroups = (result) => {
+    const direct = result.groups.filter((g) => g.tier === 'direct');
+    const partial = result.groups.filter((g) => g.tier !== 'direct');
+    const blocks = [];
+    if (direct.length) {
+      blocks.push(`■ 질문을 직접 다루는 매뉴얼\n\n${direct.map(renderGroup).join('\n\n')}`);
+    }
+    if (partial.length) {
+      blocks.push(
+        `■ 부분 관련 (일부 키워드만 일치 — 보조 참고용)\n\n${partial.map(renderGroup).join('\n\n')}`,
+      );
+    }
+    return blocks.join('\n\n');
+  };
+
+  /**
+   * Which terms failed, and how. A term matching zero pages is probably a typo
+   * or absent from the manuals; one matching thousands is a stopword the
+   * filter did not catch. Both ruin coverage, and only the counts distinguish
+   * them — so the counts are what gets reported rather than a generic nudge.
+   */
+  function partialAdvice(result) {
+    const stats = result.terms ?? [];
+    if (stats.length === 0) return '';
+    const dead = stats.filter((t) => t.pages === 0).map((t) => t.term);
+    const flood = stats.filter((t) => t.pages > 300).map((t) => t.term);
+    const good = stats.filter((t) => t.pages > 0 && t.pages <= 300).map((t) => t.term);
+
+    const lines = ['\n(모든 키워드를 포함한 페이지가 없어 일부만 일치한 결과입니다.'];
+    if (dead.length) lines.push(` 매칭 0건: ${dead.join(', ')}`);
+    if (flood.length) lines.push(` 너무 광범위: ${flood.join(', ')}`);
+    if (good.length) lines.push(` 유효: ${good.join(', ')} — 이 키워드만으로 다시 검색해 보세요.`);
+    else lines.push(' 다른 표현으로 바꿔 다시 검색하거나 hrbook_catalog 를 사용하세요.');
+    return `${lines.join('')})`;
+  }
 
   const legacyNoticeShown = { done: false };
   async function noticeLegacyClones() {
@@ -312,6 +404,12 @@ export const HrBookPlugin = async ({ client }) => {
           startSecondary();
           void noticeLegacyClones();
 
+          // Answered before searching: "어떤 매뉴얼이 있냐" wants a list of
+          // manual ids, and page fragments are the wrong shape for it.
+          const catalogueHint = looksLikeCatalogueQuery(args.query)
+            ? `[HRBook] 이 질문은 매뉴얼 자체를 찾는 질문으로 보입니다. hrbook_catalog 를 사용하세요.\n\n`
+            : '';
+
           // The toast that announced the download is gone by the time the
           // answer appears, and the tool blocks until preparation finishes —
           // so there is no moment at which the model could have said "fetching
@@ -324,31 +422,50 @@ export const HrBookPlugin = async ({ client }) => {
               ` 이 사실을 사용자에게 한 문장으로 전달하세요.\n\n`
             : '';
 
-          const base = { book: args.book_id, limit: args.limit };
+          // `product` was accepted and then dropped on the floor: the model
+          // could narrow to hi6 or hi7 and nothing changed. Resolved to a book
+          // list here, because the indexes on disk carry no product metadata.
+          let books;
+          if (args.product) {
+            try {
+              const infos = await loadBookinfos();
+              books = [
+                ...new Set(
+                  infos
+                    .filter((e) => e.products?.includes(args.product.toLowerCase()))
+                    .map((e) => e.book_id),
+                ),
+              ];
+            } catch {
+              books = undefined;
+            }
+          }
+
+          const base = { book: args.book_id, books, limit: args.limit };
           let lang = args.lang || PRIMARY_LANG;
           let result = await search(args.query, { ...base, lang });
 
           // Fall through to the other language rather than reporting nothing:
           // some manuals are only meaningful in English, and the user should
           // not have to know which.
-          if (result.hits.length === 0 && !args.lang && SECONDARY_LANG !== PRIMARY_LANG) {
+          if (result.groups.length === 0 && !args.lang && SECONDARY_LANG !== PRIMARY_LANG) {
             const alt = await search(args.query, { ...base, lang: SECONDARY_LANG });
-            if (alt.hits.length > 0) {
+            if (alt.groups.length > 0) {
               lang = SECONDARY_LANG;
               result = alt;
             }
           }
 
-          if (result.hits.length > 0) {
-            const changed = await refreshHits(result.hits);
+          if (result.groups.length > 0) {
+            const changed = await refreshHits(result.groups);
             if (changed.length > 0) {
               result = await search(args.query, { ...base, lang });
             }
           }
 
-          if (result.hits.length === 0) {
+          if (result.groups.length === 0) {
             const indexes = await listIndexes();
-            return notice + [
+            return notice + catalogueHint + [
               `"${args.query}" 에 대한 결과가 없습니다 (${result.scanned}개 페이지 검색, 매뉴얼 ${indexes.length}권).`,
               '매뉴얼은 정상적으로 준비되어 있으며, 검색어와 일치하는 내용이 없는 것입니다.',
               // Spell out the boundary. Left to a bare "no match", models fill
@@ -359,11 +476,21 @@ export const HrBookPlugin = async ({ client }) => {
             ].join('\n');
           }
 
-          return (
-            notice +
-            `${result.hits.length}/${result.total} match(es) in ${result.scanned} pages (lang=${lang}):\n` +
-            formatHits(result.hits, result.total)
-          );
+          // Saying so matters: a partial result looks like a complete one to
+          // the model, which then answers confidently from a page that only
+          // matched half the question. Naming the terms that failed turns
+          // "try again" into something actionable — the model can see which
+          // word found nothing and which found everything.
+          const quality = result.partial ? partialAdvice(result) : '';
+
+          const header =
+            `매뉴얼 ${result.bookCount}권 / ${result.total}개 페이지 일치 ` +
+            `(직접 관련 ${result.directCount ?? 0}권, ${result.scanned}개 페이지 검색, lang=${lang})` +
+            (result.bookCount > result.groups.length
+              ? ` — 상위 ${result.groups.length}권만 표시`
+              : '');
+
+          return `${notice}${catalogueHint}${header}\n\n${formatGroups(result)}${quality}`;
         },
       }),
 
@@ -381,14 +508,17 @@ export const HrBookPlugin = async ({ client }) => {
 
           if (hasIndex(args.book_id, args.ver_id)) {
             try {
-              const { text, truncated, url } = await readPage(
+              const { text, truncated, url, warning } = await readPage(
                 args.book_id,
                 args.ver_id,
                 args.path,
                 args.maxBytes,
                 variables,
               );
-              return `${url}\n\n${text}${truncated ? '\n\n[truncated — raise maxBytes for more]' : ''}`;
+              return (
+                `${url}${warning ? '\n[안전 경고 포함 — 답변에서 생략하지 마세요]' : ''}\n\n${text}` +
+                `${truncated ? '\n\n[truncated — raise maxBytes for more]' : ''}`
+              );
             } catch (err) {
               await log(`index read failed ${args.book_id}/${args.ver_id}: ${err.message}`, 'warn');
             }
@@ -405,7 +535,10 @@ export const HrBookPlugin = async ({ client }) => {
               args.maxBytes,
               variables,
             );
-            return `${url}\n\n${text}${truncated ? '\n\n[truncated — raise maxBytes for more]' : ''}`;
+            return (
+              `${url}${hasWarning(text) ? '\n[안전 경고 포함 — 답변에서 생략하지 마세요]' : ''}\n\n${text}` +
+              `${truncated ? '\n\n[truncated — raise maxBytes for more]' : ''}`
+            );
           } catch (err) {
             return (
               `${args.book_id}/${args.ver_id}/${args.path} 를 읽지 못했습니다 (${brief(err)}).\n` +
